@@ -19,6 +19,7 @@ export const sessionMiddleware: RequestHandler = session({
   resave: false,
   saveUninitialized: false,
   rolling: true,
+  proxy: true,
   cookie: {
     httpOnly: true,
     secure: true,
