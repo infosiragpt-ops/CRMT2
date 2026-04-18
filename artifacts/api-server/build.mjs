@@ -29,6 +29,11 @@ async function buildAll() {
     // - use path traversal to read files (e.g. @google-cloud/secret-manager loads sibling .proto files)
     external: [
       "*.node",
+      "whatsapp-web.js",
+      "qrcode-terminal",
+      "fluent-ffmpeg",
+      "connect-pg-simple",
+      "express-session",
       "sharp",
       "better-sqlite3",
       "sqlite3",
