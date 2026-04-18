@@ -21,8 +21,8 @@ export const sessionMiddleware: RequestHandler = session({
   rolling: true,
   cookie: {
     httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
+    secure: true,
+    sameSite: "none",
     maxAge: 1000 * 60 * 60 * 24 * 30,
   },
 });
