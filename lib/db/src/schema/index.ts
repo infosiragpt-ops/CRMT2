@@ -94,6 +94,7 @@ export const chatsTable = pgTable(
     favorited: boolean("favorited").notNull().default(false),
     pinned: boolean("pinned").notNull().default(false),
     muted: boolean("muted").notNull().default(false),
+    emailNotifications: boolean("email_notifications").notNull().default(true),
     manuallyUnread: boolean("manually_unread").notNull().default(false),
     unreadCount: integer("unread_count").notNull().default(0),
     lastMessageAt: timestamp("last_message_at", { withTimezone: true }),
@@ -138,6 +139,32 @@ export const messagesTable = pgTable(
 
 export type Message = typeof messagesTable.$inferSelect;
 export type InsertMessage = typeof messagesTable.$inferInsert;
+
+export const chatNotesTable = pgTable(
+  "chat_notes",
+  {
+    id: serial("id").primaryKey(),
+    chatId: integer("chat_id")
+      .notNull()
+      .references(() => chatsTable.id, { onDelete: "cascade" }),
+    authorUserId: integer("author_user_id")
+      .notNull()
+      .references(() => usersTable.id, { onDelete: "cascade" }),
+    body: text("body").notNull().default(""),
+    fileName: text("file_name"),
+    filePath: text("file_path"),
+    fileMimeType: text("file_mime_type"),
+    fileSizeBytes: integer("file_size_bytes"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    chatCreatedIdx: index("chat_notes_chat_created_idx").on(t.chatId, t.createdAt),
+    authorIdx: index("chat_notes_author_idx").on(t.authorUserId),
+  }),
+);
+
+export type ChatNote = typeof chatNotesTable.$inferSelect;
+export type InsertChatNote = typeof chatNotesTable.$inferInsert;
 
 export const labelsTable = pgTable(
   "labels",

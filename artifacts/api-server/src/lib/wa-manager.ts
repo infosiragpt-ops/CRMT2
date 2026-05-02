@@ -41,6 +41,11 @@ type WAChatLike = {
   getContact?: () => Promise<WAContactLike>;
 };
 
+type PhoneResolution = {
+  phoneNumber: string;
+  source: "whatsapp-id" | "lid-resolution" | "contact";
+};
+
 const SESSIONS_DIR = process.env.WA_SESSIONS_DIR || path.resolve(process.cwd(), ".wa-sessions");
 fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
@@ -96,12 +101,53 @@ function serializedWid(value: unknown): string | null {
   return typeof serialized === "string" && serialized.trim() ? serialized : null;
 }
 
+function digitsOnly(value: unknown): string {
+  return typeof value === "string" ? value.replace(/\D/g, "") : "";
+}
+
+function phoneNumberFromSerializedWid(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const [user, server] = value.trim().split("@");
+  if (!user || !server) return null;
+  if (server !== "c.us" && server !== "s.whatsapp.net") return null;
+  const digits = digitsOnly(user);
+  return digits.length >= 6 ? digits : null;
+}
+
+function phoneNumberFromResolvedValue(value: unknown): string | null {
+  const serialized = serializedWid(value);
+  const fromWid = phoneNumberFromSerializedWid(serialized);
+  if (fromWid) return fromWid;
+  const digits = digitsOnly(value);
+  return digits.length >= 6 ? digits : null;
+}
+
+function phoneCodeFromNumber(value: string | null | undefined): string | null {
+  const digits = digitsOnly(value);
+  return digits.length >= 6 ? digits.slice(-6) : null;
+}
+
+function normalizedLid(value: unknown): string | null {
+  const raw = serializedWid(value) ?? (typeof value === "string" ? value.trim() : "");
+  if (!raw) return null;
+  if (raw.endsWith("@lid")) return raw;
+  const digits = digitsOnly(raw);
+  return digits ? `${digits}@lid` : null;
+}
+
 function cleanProfilePicUrl(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value : null;
 }
 
 function addProfilePicCandidate(candidates: string[], value: string | null | undefined) {
   if (value && !candidates.includes(value)) candidates.push(value);
+}
+
+function addPhoneProfilePicCandidates(candidates: string[], value: unknown) {
+  const phoneNumber = phoneNumberFromResolvedValue(value);
+  if (!phoneNumber) return;
+  addProfilePicCandidate(candidates, `${phoneNumber}@c.us`);
+  addProfilePicCandidate(candidates, `${phoneNumber}@s.whatsapp.net`);
 }
 
 class WAManager {
@@ -128,15 +174,15 @@ class WAManager {
 
       if (chatId.endsWith("@lid") && typeof state.client.getContactLidAndPhone === "function") {
         const [resolved] = await state.client.getContactLidAndPhone([chatId]);
-        addProfilePicCandidate(candidates, resolved?.pn);
         addProfilePicCandidate(candidates, resolved?.lid);
+        addPhoneProfilePicCandidates(candidates, resolved?.pn);
       }
 
       const chat = (await state.client.getChatById(chatId)) as WAChatLike;
       if (typeof chat.getContact === "function") {
         const contact = await chat.getContact();
         addProfilePicCandidate(candidates, serializedWid(contact.id));
-        addProfilePicCandidate(candidates, contact.number ? `${contact.number}@c.us` : null);
+        addPhoneProfilePicCandidates(candidates, contact.number);
         if (!url && typeof contact.getProfilePicUrl === "function") {
           try {
             url = cleanProfilePicUrl(await contact.getProfilePicUrl());
@@ -160,7 +206,7 @@ class WAManager {
       url = null;
     }
 
-    this.profilePicCache.set(key, { url, expiresAt: now + 60 * 60_000 });
+    this.profilePicCache.set(key, { url, expiresAt: now + (url ? 60 * 60_000 : 90_000) });
     if (this.profilePicCache.size > 2000) {
       for (const [cacheKey, value] of this.profilePicCache) {
         if (value.expiresAt <= now || this.profilePicCache.size > 2000) {
@@ -604,34 +650,112 @@ class WAManager {
     }
   }
 
+  private async resolveLidPhoneNumbers(
+    client: WAClient,
+    ids: string[],
+  ): Promise<Map<string, PhoneResolution>> {
+    const uniqueIds = Array.from(new Set(ids.filter((id) => id.endsWith("@lid"))));
+    const requested = new Set(uniqueIds);
+    const resolvedPhones = new Map<string, PhoneResolution>();
+    if (uniqueIds.length === 0 || typeof client.getContactLidAndPhone !== "function") {
+      return resolvedPhones;
+    }
+
+    try {
+      const rows = await client.getContactLidAndPhone(uniqueIds);
+      rows.forEach((row) => {
+        const lid = normalizedLid(row.lid);
+        const phoneNumber = phoneNumberFromResolvedValue(row.pn);
+        // Never map by array position. If WhatsApp does not echo the LID, the
+        // association is ambiguous and must be treated as unverified.
+        if (lid && requested.has(lid) && phoneNumber) {
+          resolvedPhones.set(lid, { phoneNumber, source: "lid-resolution" });
+        }
+      });
+    } catch (err) {
+      logger.warn({ err }, "failed to resolve WhatsApp LID phone numbers");
+    }
+
+    return resolvedPhones;
+  }
+
   async getChats(sessionId: string) {
     const s = this.devices.get(sessionId);
     if (!s || s.status !== "ready") throw new Error("Device not ready");
     const chats = (await s.client.getChats()) as any[];
-    const mapped = chats.map((c) => {
+    const lidIds: string[] = [];
+    for (const c of chats) {
+      const chatId = serializedWid(c.id) ?? String(c.id ?? "");
+      if (chatId.endsWith("@lid")) lidIds.push(chatId);
+      if (Array.isArray(c.participants)) {
+        for (const participant of c.participants) {
+          const participantId = serializedWid(participant.id) ?? String(participant.id ?? "");
+          if (participantId.endsWith("@lid")) lidIds.push(participantId);
+        }
+      }
+    }
+    const lidPhones = await this.resolveLidPhoneNumbers(s.client, lidIds);
+
+    const mapped = await Promise.all(chats.map(async (c) => {
       const id = c.id?._serialized ?? c.id;
+      const serializedId = String(id);
+      const directPhoneFromId = phoneNumberFromSerializedWid(serializedId);
+      const lidPhone = lidPhones.get(serializedId) ?? null;
+      let phoneNumber = directPhoneFromId ?? lidPhone?.phoneNumber ?? null;
+      let phoneCodeSource: PhoneResolution["source"] | null = directPhoneFromId
+        ? "whatsapp-id"
+        : lidPhone?.source ?? null;
+      if (!c.isGroup && !phoneNumber && typeof c.getContact === "function") {
+        try {
+          const contact = await c.getContact();
+          phoneNumber =
+            phoneNumberFromSerializedWid(serializedWid(contact.id)) ??
+            phoneNumberFromResolvedValue(contact.number);
+          phoneCodeSource = phoneNumber ? "contact" : null;
+        } catch {
+          phoneNumber = null;
+          phoneCodeSource = null;
+        }
+      }
+      const phoneCode = phoneCodeFromNumber(phoneNumber);
       const participants = Array.isArray(c.participants)
         ? c.participants.map((participant: any) => {
-            const participantId = participant.id?._serialized ?? participant.id ?? "";
-            const participantUser = participant.id?.user ?? String(participantId).split("@")[0] ?? "";
+            const participantId = serializedWid(participant.id) ?? String(participant.id ?? "");
+            const participantUser = participant.id?.user ?? participantId.split("@")[0] ?? "";
+            const participantLidPhone = lidPhones.get(participantId) ?? null;
+            const participantDirectPhoneNumber = phoneNumberFromSerializedWid(participantId);
+            const participantPhoneNumber =
+              participantDirectPhoneNumber ??
+              participantLidPhone?.phoneNumber ??
+              null;
+            const participantPhoneCodeSource: PhoneResolution["source"] | null =
+              participantDirectPhoneNumber ? "whatsapp-id" : participantLidPhone?.source ?? null;
             return {
-              id: String(participantId),
+              id: participantId,
               name: participant.name || participant.pushname || participant.shortName || participantUser,
+              phoneNumber: participantPhoneNumber,
+              phoneCode: phoneCodeFromNumber(participantPhoneNumber),
+              phoneCodeVerified: !!participantPhoneNumber,
+              phoneCodeSource: participantPhoneCodeSource,
               isAdmin: !!participant.isAdmin || !!participant.isSuperAdmin,
             };
           })
         : [];
       return {
-        id,
+        id: serializedId,
         name: c.name || c.formattedTitle || c.id?.user || "",
         isGroup: c.isGroup,
+        phoneNumber,
+        phoneCode,
+        phoneCodeVerified: !!phoneNumber,
+        phoneCodeSource,
         participants,
         unreadCount: c.unreadCount ?? 0,
         timestamp: c.timestamp ?? null,
         lastMessage: c.lastMessage ? serializeMessage(c.lastMessage) : null,
         profilePicUrl: null as string | null,
       };
-    });
+    }));
 
     return mapped;
   }
@@ -660,10 +784,14 @@ class WAManager {
     return chat.sendSeen?.() ?? false;
   }
 
-  async sendMessage(sessionId: string, chatId: string, body: string) {
+  async sendMessage(sessionId: string, chatId: string, body: string, quotedMessageId?: string) {
     const s = this.devices.get(sessionId);
     if (!s || s.status !== "ready") throw new Error("Device not ready");
-    const sent = await s.client.sendMessage(chatId, body);
+    const sent = await s.client.sendMessage(
+      chatId,
+      body,
+      quotedMessageId ? { quotedMessageId, ignoreQuoteErrors: false } : undefined,
+    );
     return serializeMessage(sent);
   }
 
@@ -694,6 +822,33 @@ function serializeMessage(m: any) {
   const chatId = m.from === m.to ? m.from : (m.fromMe ? m.to : m.from);
   const mediaMimeType = (m._data?.mimetype ?? m.mimetype ?? null) as string | null;
   const mediaFileName = (m._data?.filename ?? m.filename ?? null) as string | null;
+  const quoted = m._data?.quotedMsg ?? null;
+  const quotedId =
+    m._data?.quotedStanzaID ??
+    quoted?.id?._serialized ??
+    quoted?.id?.id ??
+    null;
+  const quotedParticipantRaw =
+    m._data?.quotedParticipant ??
+    quoted?.author ??
+    quoted?.from ??
+    quoted?.id?.remote ??
+    null;
+  const quotedParticipant =
+    typeof quotedParticipantRaw === "string"
+      ? quotedParticipantRaw
+      : (quotedParticipantRaw?._serialized ?? null);
+  const quotedBody =
+    quoted?.body ??
+    quoted?.caption ??
+    quoted?.pollName ??
+    (quoted?.type ? `[${quoted.type}]` : null);
+  const quotedFromMe =
+    typeof quoted?.id?.fromMe === "boolean"
+      ? quoted.id.fromMe
+      : typeof quoted?.fromMe === "boolean"
+        ? quoted.fromMe
+        : null;
   return {
     id: (m.id?._serialized ?? m.id) as string,
     chatId: chatId as string,
@@ -708,6 +863,10 @@ function serializeMessage(m: any) {
     mediaUrl: null as string | null,
     mediaMimeType,
     mediaFileName,
+    quotedMessageId: quotedId as string | null,
+    quotedBody: (quotedBody ?? null) as string | null,
+    quotedParticipant: quotedParticipant as string | null,
+    quotedFromMe,
   };
 }
 

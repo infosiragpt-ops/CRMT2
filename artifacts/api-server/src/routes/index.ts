@@ -4,6 +4,7 @@ import authRouter from "./auth";
 import devicesRouter from "./devices";
 import labelsRouter from "./labels";
 import chatStateRouter from "./chat-state";
+import chatNotesRouter from "./chat-notes";
 import quickRepliesRouter from "./quick-replies";
 import collaboratorsRouter from "./collaborators";
 
@@ -14,6 +15,7 @@ router.use(authRouter);
 router.use(devicesRouter);
 router.use(labelsRouter);
 router.use(chatStateRouter);
+router.use(chatNotesRouter);
 router.use(quickRepliesRouter);
 router.use(collaboratorsRouter);
 

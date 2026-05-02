@@ -80,6 +80,14 @@ export const uploadChatMedia = multer({
   },
 });
 
+export const uploadChatNoteFile = multer({
+  storage,
+  limits: { fileSize: 75 * 1024 * 1024, files: 1 },
+  fileFilter(_req, _file, cb) {
+    cb(null, true);
+  },
+});
+
 export function publicUrlFor(storedPath: string): string {
   const rel = path.relative(UPLOADS_DIR, storedPath);
   return `/uploads/${rel.split(path.sep).join("/")}`;

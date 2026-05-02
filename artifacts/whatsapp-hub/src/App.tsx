@@ -168,7 +168,13 @@ function App() {
             <TooltipProvider>
               <AppRouter />
               <Toaster />
-              <SonnerToaster position="top-right" richColors />
+              <SonnerToaster
+                position="top-right"
+                richColors
+                gap={6}
+                visibleToasts={4}
+                offset={{ top: 14, right: 14 }}
+              />
             </TooltipProvider>
           </SocketProvider>
         </AuthProvider>

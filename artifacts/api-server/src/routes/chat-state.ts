@@ -21,7 +21,7 @@ router.patch("/devices/:sessionId/chats/:waChatId/state", async (req, res) => {
   });
 
   const patch: Partial<typeof chatsTable.$inferInsert> & { updatedAt?: Date } = { updatedAt: new Date() };
-  for (const key of ["archived", "favorited", "pinned", "muted", "manuallyUnread"] as const) {
+  for (const key of ["archived", "favorited", "pinned", "muted", "emailNotifications", "manuallyUnread"] as const) {
     if (typeof req.body?.[key] === "boolean") patch[key] = req.body[key];
   }
   if (req.body?.manuallyUnread === true) {
