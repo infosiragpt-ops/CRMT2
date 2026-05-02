@@ -151,6 +151,11 @@ function errorMessage(err: unknown) {
   return err instanceof Error ? err.message : String(err);
 }
 
+function requireWhatsappPuppeteer() {
+  const whatsappRequire = createRequire(require.resolve("whatsapp-web.js"));
+  return whatsappRequire("puppeteer") as PuppeteerModuleLike;
+}
+
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -174,7 +179,7 @@ async function waitForMainFrame(page: PuppeteerPageLike, timeoutMs = 30_000) {
 }
 
 function patchPuppeteerLaunchForWhatsApp() {
-  const puppeteer = require("puppeteer") as PuppeteerModuleLike;
+  const puppeteer = requireWhatsappPuppeteer();
   if (puppeteer.__crmWaPatched) return;
 
   const originalLaunch = puppeteer.launch.bind(puppeteer);
