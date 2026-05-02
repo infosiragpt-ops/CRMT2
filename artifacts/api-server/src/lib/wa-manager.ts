@@ -45,6 +45,20 @@ type WAChatLike = {
   getContact?: () => Promise<WAContactLike>;
 };
 
+type PuppeteerPageLike = {
+  mainFrame: () => unknown;
+};
+
+type PuppeteerBrowserLike = {
+  pages: () => Promise<PuppeteerPageLike[]>;
+  newPage?: () => Promise<PuppeteerPageLike>;
+};
+
+type PuppeteerModuleLike = {
+  launch: (options: unknown) => Promise<PuppeteerBrowserLike>;
+  __crmWaPatched?: boolean;
+};
+
 type PhoneResolution = {
   phoneNumber: string;
   source: "whatsapp-id" | "lid-resolution" | "contact";
@@ -135,6 +149,63 @@ function resolveBrowserExecutablePath() {
 
 function errorMessage(err: unknown) {
   return err instanceof Error ? err.message : String(err);
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForMainFrame(page: PuppeteerPageLike, timeoutMs = 5000) {
+  const startedAt = Date.now();
+  let lastError: unknown;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      page.mainFrame();
+      return;
+    } catch (err) {
+      lastError = err;
+      if (!errorMessage(err).includes("main frame")) throw err;
+      await delay(75);
+    }
+  }
+
+  throw lastError ?? new Error("Timed out waiting for Chromium main frame");
+}
+
+function patchPuppeteerLaunchForWhatsApp() {
+  const puppeteer = require("puppeteer") as PuppeteerModuleLike;
+  if (puppeteer.__crmWaPatched) return;
+
+  const originalLaunch = puppeteer.launch.bind(puppeteer);
+  puppeteer.launch = async (options: unknown) => {
+    const browser = await originalLaunch(options);
+    const originalPages = browser.pages.bind(browser);
+
+    browser.pages = async () => {
+      const pages = await originalPages();
+      if (pages[0]) {
+        try {
+          await waitForMainFrame(pages[0]);
+          return pages;
+        } catch (err) {
+          logger.warn({ err }, "initial Chromium page was not ready; opening a fresh page");
+        }
+      }
+
+      if (typeof browser.newPage === "function") {
+        const page = await browser.newPage();
+        await waitForMainFrame(page);
+        return [page, ...pages];
+      }
+
+      return pages;
+    };
+
+    return browser;
+  };
+
+  puppeteer.__crmWaPatched = true;
 }
 
 function sanitizeFileName(value: string) {
@@ -399,6 +470,8 @@ class WAManager {
       }
     }
 
+    patchPuppeteerLaunchForWhatsApp();
+
     const { Client, LocalAuth } = require("whatsapp-web.js") as {
       Client: new (opts: unknown) => WAClient;
       LocalAuth: new (opts: unknown) => unknown;
@@ -417,8 +490,10 @@ class WAManager {
           "--disable-gpu",
           "--no-first-run",
           "--no-zygote",
-          "--single-process",
           "--disable-extensions",
+          "--disable-background-networking",
+          "--disable-default-apps",
+          "--disable-sync",
         ],
       },
     });
