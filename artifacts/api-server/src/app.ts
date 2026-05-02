@@ -1,4 +1,4 @@
-import express, { type Express } from "express";
+import express, { type ErrorRequestHandler, type Express } from "express";
 import cors from "cors";
 import pinoHttp from "pino-http";
 import router from "./routes";
@@ -59,5 +59,23 @@ app.use(sessionMiddleware);
 
 app.use("/uploads", express.static(UPLOADS_DIR, { fallthrough: true, maxAge: "7d" }));
 app.use("/api", router);
+
+const errorHandler: ErrorRequestHandler = (err, req, res, next) => {
+  if (res.headersSent) return next(err);
+
+  const rawStatus = Number(err?.status ?? err?.statusCode);
+  const status = rawStatus >= 400 && rawStatus < 600 ? rawStatus : 500;
+  const message =
+    status >= 500
+      ? "Internal server error"
+      : typeof err?.message === "string" && err.message
+        ? err.message
+        : "Request failed";
+
+  logger.error({ err, method: req.method, path: req.path, status }, "request failed");
+  res.status(status).json({ error: message });
+};
+
+app.use(errorHandler);
 
 export default app;

@@ -31,7 +31,19 @@ export default function Login() {
         await refresh();
         setLocation("/");
       } else {
-        const error = await res.text();
+        let error = "Could not log in.";
+        try {
+          const contentType = res.headers.get("content-type") ?? "";
+          if (contentType.includes("application/json")) {
+            const data = await res.json();
+            error = typeof data?.error === "string" ? data.error : error;
+          } else {
+            const text = await res.text();
+            error = res.status >= 500 ? "Server error. Check the Replit console logs." : text || error;
+          }
+        } catch {
+          error = res.status >= 500 ? "Server error. Check the Replit console logs." : error;
+        }
         toast({
           title: "Login failed",
           description: error,
