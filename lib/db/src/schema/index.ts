@@ -56,6 +56,40 @@ export const usersTable = pgTable("users", {
 export type User = typeof usersTable.$inferSelect;
 export type InsertUser = typeof usersTable.$inferInsert;
 
+export type AgentTrainingConfig = {
+  voiceReplies?: boolean;
+  audioToText?: boolean;
+  trainingEnabled?: {
+    text?: boolean;
+    images?: boolean;
+    video?: boolean;
+    pdf?: boolean;
+  };
+  responseScope?: string;
+  selectedLabelIds?: number[];
+  textRules?: Array<{ trigger: string; response: string }>;
+  assets?: {
+    images?: Array<{ fileName: string; mimeType: string; sizeBytes: number; trigger: string; storedPath?: string }>;
+    video?: Array<{ fileName: string; mimeType: string; sizeBytes: number; trigger: string; storedPath?: string }>;
+    pdf?: Array<{ fileName: string; mimeType: string; sizeBytes: number; trigger: string; storedPath?: string }>;
+  };
+};
+
+export const agentSettingsTable = pgTable("agent_settings", {
+  userId: integer("user_id")
+    .primaryKey()
+    .references(() => usersTable.id, { onDelete: "cascade" }),
+  enabled: boolean("enabled").notNull().default(false),
+  model: text("model").notNull().default("gpt-4.1-mini"),
+  openAiApiKeyEncrypted: text("openai_api_key_encrypted"),
+  trainingConfig: jsonb("training_config").$type<AgentTrainingConfig>().notNull().default({}),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export type AgentSettings = typeof agentSettingsTable.$inferSelect;
+export type InsertAgentSettings = typeof agentSettingsTable.$inferInsert;
+
 export const devicesTable = pgTable(
   "devices",
   {

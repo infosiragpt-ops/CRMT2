@@ -20,6 +20,16 @@ import { requirePermission } from "../lib/permissions";
 const router: IRouter = Router();
 
 router.use(requireAuth);
+router.use((req, res, next) => {
+  if (!req.path.endsWith("/profile-picture/image")) {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    res.setHeader("Surrogate-Control", "no-store");
+    res.setHeader("ETag", `"${crypto.randomUUID()}"`);
+  }
+  next();
+});
 
 type StoredChatRow = {
   id: number;
@@ -64,6 +74,11 @@ function profilePictureInfoPath(sessionId: string, chatId: string) {
 
 function profilePictureImagePath(sessionId: string, chatId: string) {
   return `/api/devices/${encodeURIComponent(sessionId)}/chats/${encodeURIComponent(chatId)}/profile-picture/image`;
+}
+
+function ensureDeviceClientRestoring(device: Pick<DeviceRow, "sessionId" | "status">) {
+  if (waManager.getState(device.sessionId) || !["ready", "authenticated"].includes(device.status)) return;
+  void waManager.start(device.sessionId).catch(() => undefined);
 }
 
 function phoneInfoFromWaChatId(chatId: string) {
@@ -130,9 +145,17 @@ function storedMessageFromRow(row: {
     hasMedia: row.hasMedia,
     type: row.type,
     author: row.author,
+    ack: null,
+    isForwarded: false,
+    isStarred: false,
+    hasReaction: false,
     mediaUrl: row.mediaPath ? publicUrlFor(row.mediaPath) : null,
     mediaMimeType: row.mediaType,
     mediaFileName: fileName,
+    quotedMessageId: null,
+    quotedBody: null,
+    quotedParticipant: null,
+    quotedFromMe: null,
   };
 }
 
@@ -200,7 +223,11 @@ async function getStoredChats(device: { id: number; sessionId: string }) {
         labels: labelsByChat.get(chat.id) ?? [],
       };
     })
-    .sort((a, b) => b.timestamp - a.timestamp);
+    .sort((a, b) => {
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      if (a.favorited !== b.favorited) return a.favorited ? -1 : 1;
+      return b.timestamp - a.timestamp;
+    });
 }
 
 router.get("/devices", async (req, res) => {
@@ -250,8 +277,10 @@ router.delete("/devices/:sessionId", requireAdmin, async (req, res) => {
 });
 
 router.get("/devices/:sessionId/chats", async (req, res) => {
-  const device = await findDeviceBySessionForUser(req.session.userId!, req.params.sessionId);
+  const sessionIdParam = String(req.params.sessionId);
+  const device = (await findDeviceBySessionForUser(req.session.userId!, sessionIdParam)) as DeviceRow | null;
   if (!device) return res.status(404).json({ error: "Not found" });
+  ensureDeviceClientRestoring(device);
   try {
     const liveChats = (await waManager.getChats(device.sessionId)) as LiveChatRow[];
 
@@ -349,8 +378,10 @@ router.get("/devices/:sessionId/chats/:chatId/profile-picture/image", async (req
 });
 
 router.get("/devices/:sessionId/chats/:chatId/messages", async (req, res) => {
-  const device = await findDeviceBySessionForUser(req.session.userId!, req.params.sessionId);
+  const sessionIdParam = String(req.params.sessionId);
+  const device = (await findDeviceBySessionForUser(req.session.userId!, sessionIdParam)) as DeviceRow | null;
   if (!device) return res.status(404).json({ error: "Not found" });
+  ensureDeviceClientRestoring(device);
   const limit = Math.min(200, Number(req.query.limit) || 50);
   try {
     const msgs = await waManager.getMessages(device.sessionId, req.params.chatId, limit);
@@ -381,6 +412,108 @@ router.post("/devices/:sessionId/chats/:chatId/messages", async (req, res) => {
       typeof quotedMessageId === "string" && quotedMessageId.trim() ? quotedMessageId.trim() : undefined,
     );
     res.json(msg);
+  } catch (err) {
+    res.status(409).json({ error: (err as Error).message });
+  }
+});
+
+function cleanRequiredString(value: unknown, field: string, maxLength = 400) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error(`${field} requerido`);
+  }
+  return value.trim().slice(0, maxLength);
+}
+
+async function deviceForMessageAction(userId: number, sessionId: string) {
+  return findDeviceBySessionForUser(userId, sessionId);
+}
+
+router.post("/devices/:sessionId/messages/info", async (req, res) => {
+  const device = await deviceForMessageAction(req.session.userId!, String(req.params.sessionId));
+  if (!device) return res.status(404).json({ error: "Not found" });
+  try {
+    const messageId = cleanRequiredString(req.body?.messageId, "messageId", 512);
+    res.json(await waManager.getMessageInfo(device.sessionId, messageId));
+  } catch (err) {
+    res.status(409).json({ error: (err as Error).message });
+  }
+});
+
+router.post("/devices/:sessionId/messages/react", async (req, res) => {
+  if (!(await requirePermission(req, res, "canReply"))) return;
+  const device = await deviceForMessageAction(req.session.userId!, String(req.params.sessionId));
+  if (!device) return res.status(404).json({ error: "Not found" });
+  try {
+    const messageId = cleanRequiredString(req.body?.messageId, "messageId", 512);
+    const reaction = typeof req.body?.reaction === "string" ? req.body.reaction.trim().slice(0, 16) : "";
+    if (!reaction) return res.status(400).json({ error: "Reacción requerida" });
+    res.json(await waManager.reactToMessage(device.sessionId, messageId, reaction));
+  } catch (err) {
+    res.status(409).json({ error: (err as Error).message });
+  }
+});
+
+router.post("/devices/:sessionId/messages/forward", async (req, res) => {
+  if (!(await requirePermission(req, res, "canReply"))) return;
+  const device = await deviceForMessageAction(req.session.userId!, String(req.params.sessionId));
+  if (!device) return res.status(404).json({ error: "Not found" });
+  try {
+    const messageId = cleanRequiredString(req.body?.messageId, "messageId", 512);
+    const targetChatId = cleanRequiredString(req.body?.targetChatId, "targetChatId", 256);
+    res.json(await waManager.forwardMessage(device.sessionId, messageId, targetChatId));
+  } catch (err) {
+    res.status(409).json({ error: (err as Error).message });
+  }
+});
+
+router.post("/devices/:sessionId/messages/download", async (req, res) => {
+  const device = await deviceForMessageAction(req.session.userId!, String(req.params.sessionId));
+  if (!device) return res.status(404).json({ error: "Not found" });
+  try {
+    const messageId = cleanRequiredString(req.body?.messageId, "messageId", 512);
+    res.json(await waManager.downloadMessageMedia(device.sessionId, messageId));
+  } catch (err) {
+    res.status(409).json({ error: (err as Error).message });
+  }
+});
+
+router.post("/devices/:sessionId/messages/star", async (req, res) => {
+  if (!(await requirePermission(req, res, "canManageChats"))) return;
+  const device = await deviceForMessageAction(req.session.userId!, String(req.params.sessionId));
+  if (!device) return res.status(404).json({ error: "Not found" });
+  try {
+    const messageId = cleanRequiredString(req.body?.messageId, "messageId", 512);
+    const starred = req.body?.starred !== false;
+    res.json(await waManager.starMessage(device.sessionId, messageId, starred));
+  } catch (err) {
+    res.status(409).json({ error: (err as Error).message });
+  }
+});
+
+router.post("/devices/:sessionId/messages/pin", async (req, res) => {
+  if (!(await requirePermission(req, res, "canManageChats"))) return;
+  const device = await deviceForMessageAction(req.session.userId!, String(req.params.sessionId));
+  if (!device) return res.status(404).json({ error: "Not found" });
+  try {
+    const messageId = cleanRequiredString(req.body?.messageId, "messageId", 512);
+    const pinned = req.body?.pinned !== false;
+    const rawDuration = Number(req.body?.durationSeconds ?? 604800);
+    const duration = Number.isFinite(rawDuration)
+      ? Math.max(86400, Math.min(2592000, Math.floor(rawDuration)))
+      : 604800;
+    res.json(await waManager.pinMessage(device.sessionId, messageId, pinned, duration));
+  } catch (err) {
+    res.status(409).json({ error: (err as Error).message });
+  }
+});
+
+router.post("/devices/:sessionId/messages/delete", async (req, res) => {
+  if (!(await requirePermission(req, res, "canManageChats"))) return;
+  const device = await deviceForMessageAction(req.session.userId!, String(req.params.sessionId));
+  if (!device) return res.status(404).json({ error: "Not found" });
+  try {
+    const messageId = cleanRequiredString(req.body?.messageId, "messageId", 512);
+    res.json(await waManager.deleteMessage(device.sessionId, messageId, false));
   } catch (err) {
     res.status(409).json({ error: (err as Error).message });
   }

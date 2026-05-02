@@ -88,6 +88,35 @@ export const uploadChatNoteFile = multer({
   },
 });
 
+export const uploadAgentTrainingFiles = multer({
+  storage,
+  limits: { fileSize: 75 * 1024 * 1024, files: 40 },
+  fileFilter(_req, file, cb) {
+    const ext = path.extname(file.originalname).toLowerCase();
+    const ok =
+      file.mimetype.startsWith("image/") ||
+      file.mimetype.startsWith("video/") ||
+      [
+        ".pdf",
+        ".doc",
+        ".docx",
+        ".txt",
+        ".csv",
+        ".md",
+      ].includes(ext) ||
+      [
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "text/plain",
+        "text/csv",
+        "text/markdown",
+      ].includes(file.mimetype);
+    if (!ok) return cb(new Error("Unsupported training file type"));
+    cb(null, true);
+  },
+});
+
 export function publicUrlFor(storedPath: string): string {
   const rel = path.relative(UPLOADS_DIR, storedPath);
   return `/uploads/${rel.split(path.sep).join("/")}`;

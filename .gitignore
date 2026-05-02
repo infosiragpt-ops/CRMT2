@@ -56,6 +56,7 @@ output/
 artifacts/api-server/.wwebjs_cache/
 artifacts/api-server/uploads/
 uploads/
+waticketsaast20/
 
 # Local env
 .env

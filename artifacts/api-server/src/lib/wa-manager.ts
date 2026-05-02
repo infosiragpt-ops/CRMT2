@@ -11,6 +11,7 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import QRCode from "qrcode";
 import { ensureChat } from "./chats";
 import { publicUrlFor, UPLOADS_DIR } from "./uploads";
+import { maybeRespondWithAgent } from "./openai-agent";
 
 // whatsapp-web.js is CJS — load via createRequire so esbuild leaves it alone (it is in externals)
 import { createRequire } from "node:module";
@@ -22,6 +23,7 @@ type WAClient = {
   logout: () => Promise<void>;
   getChats: () => Promise<unknown[]>;
   getChatById: (id: string) => Promise<unknown>;
+  getMessageById?: (id: string) => Promise<unknown>;
   getProfilePicUrl?: (id: string) => Promise<string | undefined>;
   getContactLidAndPhone?: (ids: string[]) => Promise<Array<{ lid?: string; pn?: string }>>;
   sendSeen?: (chatId: string) => Promise<boolean>;
@@ -245,7 +247,16 @@ class WAManager {
     const payload = serializeMessage(msg);
     if (!this.rememberMessage(sessionId, payload.id)) return;
     void this.persistMessage(sessionId, state, msg, payload).then((storedPayload) => {
-      if (storedPayload) this.emit(sessionId, "message", storedPayload);
+      if (!storedPayload) return;
+      this.emit(sessionId, "message", storedPayload);
+      if (!storedPayload.fromMe) {
+        void maybeRespondWithAgent({
+          sessionId,
+          message: storedPayload,
+          sendMessage: (chatId, body, quotedMessageId) =>
+            this.sendMessage(sessionId, chatId, body, quotedMessageId),
+        });
+      }
     });
   }
 
@@ -624,9 +635,17 @@ class WAManager {
           hasMedia: row.hasMedia,
           type: row.type,
           author: row.author,
+          ack: null,
+          isForwarded: false,
+          isStarred: false,
+          hasReaction: false,
           mediaUrl: row.mediaPath ? publicUrlFor(row.mediaPath) : null,
           mediaMimeType: row.mediaType,
           mediaFileName: fileName,
+          quotedMessageId: null,
+          quotedBody: null,
+          quotedParticipant: null,
+          quotedFromMe: null,
         };
       });
     } catch (err) {
@@ -816,6 +835,91 @@ class WAManager {
     const sent = await s.client.sendMessage(chatId, media, caption ? { caption } : undefined);
     return serializeMessage(sent);
   }
+
+  private async getLiveMessage(sessionId: string, messageId: string) {
+    const s = this.devices.get(sessionId);
+    if (!s || s.status !== "ready") throw new Error("Device not ready");
+    if (typeof s.client.getMessageById !== "function") {
+      throw new Error("WhatsApp no permite recuperar este mensaje en esta sesión");
+    }
+    const msg = (await s.client.getMessageById(messageId)) as any;
+    if (!msg) throw new Error("Mensaje no disponible en WhatsApp Web");
+    return msg;
+  }
+
+  async getMessageInfo(sessionId: string, messageId: string) {
+    const msg = await this.getLiveMessage(sessionId, messageId);
+    const info = typeof msg.getInfo === "function" ? await msg.getInfo() : null;
+    return {
+      ...serializeMessage(msg),
+      info: info
+        ? {
+            delivery: Array.isArray(info.delivery) ? info.delivery : [],
+            deliveryRemaining: Number(info.deliveryRemaining ?? 0),
+            read: Array.isArray(info.read) ? info.read : [],
+            readRemaining: Number(info.readRemaining ?? 0),
+            played: Array.isArray(info.played) ? info.played : [],
+            playedRemaining: Number(info.playedRemaining ?? 0),
+          }
+        : null,
+    };
+  }
+
+  async reactToMessage(sessionId: string, messageId: string, reaction: string) {
+    const msg = await this.getLiveMessage(sessionId, messageId);
+    if (typeof msg.react !== "function") throw new Error("Este mensaje no admite reacciones");
+    await msg.react(reaction);
+    return { ok: true, reaction };
+  }
+
+  async forwardMessage(sessionId: string, messageId: string, targetChatId: string) {
+    const s = this.devices.get(sessionId);
+    if (!s || s.status !== "ready") throw new Error("Device not ready");
+    const msg = await this.getLiveMessage(sessionId, messageId);
+    await s.client.getChatById(targetChatId);
+    if (typeof msg.forward !== "function") throw new Error("Este mensaje no se puede reenviar");
+    await msg.forward(targetChatId);
+    return { ok: true };
+  }
+
+  async downloadMessageMedia(sessionId: string, messageId: string) {
+    const msg = await this.getLiveMessage(sessionId, messageId);
+    if (!msg.hasMedia || typeof msg.downloadMedia !== "function") {
+      throw new Error("Este mensaje no tiene archivo descargable");
+    }
+    const media = await msg.downloadMedia();
+    if (!media?.data) throw new Error("WhatsApp no devolvió el archivo");
+    return {
+      data: media.data as string,
+      mimetype: (media.mimetype || "application/octet-stream") as string,
+      filename: (media.filename || msg.filename || msg._data?.filename || null) as string | null,
+      filesize: typeof media.filesize === "number" ? media.filesize : null,
+    };
+  }
+
+  async starMessage(sessionId: string, messageId: string, starred: boolean) {
+    const msg = await this.getLiveMessage(sessionId, messageId);
+    const method = starred ? msg.star : msg.unstar;
+    if (typeof method !== "function") throw new Error("Este mensaje no admite destacado");
+    await method.call(msg);
+    return { ok: true, starred };
+  }
+
+  async pinMessage(sessionId: string, messageId: string, pinned: boolean, duration = 604800) {
+    const msg = await this.getLiveMessage(sessionId, messageId);
+    const method = pinned ? msg.pin : msg.unpin;
+    if (typeof method !== "function") throw new Error("Este mensaje no admite fijado");
+    const result = pinned ? await method.call(msg, duration) : await method.call(msg);
+    if (result === false) throw new Error("WhatsApp no permitió fijar este mensaje");
+    return { ok: true, pinned };
+  }
+
+  async deleteMessage(sessionId: string, messageId: string, everyone = false) {
+    const msg = await this.getLiveMessage(sessionId, messageId);
+    if (typeof msg.delete !== "function") throw new Error("Este mensaje no se puede eliminar");
+    await msg.delete(everyone, true);
+    return { ok: true };
+  }
 }
 
 function serializeMessage(m: any) {
@@ -860,6 +964,10 @@ function serializeMessage(m: any) {
     hasMedia: !!m.hasMedia,
     type: (m.type ?? "chat") as string,
     author: (m.author ?? null) as string | null,
+    ack: typeof m.ack === "number" ? m.ack : null,
+    isForwarded: !!m.isForwarded,
+    isStarred: !!m.isStarred,
+    hasReaction: !!m.hasReaction,
     mediaUrl: null as string | null,
     mediaMimeType,
     mediaFileName,

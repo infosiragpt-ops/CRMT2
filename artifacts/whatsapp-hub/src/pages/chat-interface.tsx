@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo, type Dispatch, type SetStateAction } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { useParams, Link, useLocation } from "wouter";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { format, isToday, isYesterday } from "date-fns";
@@ -42,6 +42,7 @@ import {
   MoreVertical,
   Package,
   Paperclip,
+  Pencil,
   Pin,
   Play,
   Plus,
@@ -75,6 +76,16 @@ import {
   ContextMenuSubTrigger,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { toast } from "sonner";
 
 type ChatLabel = { id: number; name: string; color: string };
@@ -153,7 +164,62 @@ const collaboratorPermissionOptions: {
 ];
 
 type AgentTrainingKind = "text" | "images" | "video" | "pdf";
+type AgentMediaTrainingKind = Exclude<AgentTrainingKind, "text">;
 type AgentResponseScope = "tagged" | "notTagged" | "all" | "exceptTagged";
+
+type AgentTextRule = {
+  id: string;
+  trigger: string;
+  response: string;
+};
+
+type AgentTrainingAsset = {
+  id: string;
+  file: File;
+  trigger: string;
+};
+
+type SavedAgentTrainingAsset = {
+  fileName: string;
+  mimeType: string;
+  sizeBytes: number;
+  trigger: string;
+  uploadField?: string;
+};
+
+type AgentTrainingConfigPayload = {
+  voiceReplies: boolean;
+  audioToText: boolean;
+  trainingEnabled: Record<AgentTrainingKind, boolean>;
+  responseScope: AgentResponseScope;
+  selectedLabelIds: number[];
+  textRules: Array<{ trigger: string; response: string }>;
+  assets: Record<AgentMediaTrainingKind, SavedAgentTrainingAsset[]>;
+};
+
+type AgentSettingsResponse = {
+  enabled: boolean;
+  configured: boolean;
+  apiKeyPreview?: string | null;
+  model: string;
+  trainingConfig?: Partial<AgentTrainingConfigPayload>;
+};
+
+type AgentModelsResponse = {
+  models: string[];
+  configured: boolean;
+};
+
+const DEFAULT_AGENT_MODEL = "gpt-4.1-mini";
+const DEFAULT_AGENT_MODELS = [
+  DEFAULT_AGENT_MODEL,
+  "gpt-4.1",
+  "gpt-4o-mini",
+  "gpt-4o",
+  "o4-mini",
+  "o3-mini",
+  "o3",
+];
 
 const agentTrainingCards: {
   key: AgentTrainingKind;
@@ -214,7 +280,23 @@ const agentResponseScopeOptions: {
   },
 ];
 
-const agentModelOptions = ["gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "Modelo personalizado"];
+function localId(prefix: string) {
+  return `${prefix}-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+}
+
+function restoreTextRules(value: unknown): AgentTextRule[] {
+  const rules = Array.isArray(value) ? value : [];
+  return rules
+    .map((rule) => {
+      const raw = rule && typeof rule === "object" ? (rule as Record<string, unknown>) : {};
+      return {
+        id: localId("rule"),
+        trigger: typeof raw.trigger === "string" ? raw.trigger : "",
+        response: typeof raw.response === "string" ? raw.response : "",
+      };
+    })
+    .filter((rule) => rule.trigger || rule.response);
+}
 
 function normalizeCollaboratorPermissions(value: unknown): CollaboratorPermissions {
   const raw = value && typeof value === "object" ? (value as Partial<CollaboratorPermissions>) : {};
@@ -265,6 +347,10 @@ type Message = {
   hasMedia: boolean;
   type: string;
   author?: string;
+  ack?: number | null;
+  isForwarded?: boolean;
+  isStarred?: boolean;
+  hasReaction?: boolean;
   mediaUrl?: string | null;
   mediaMimeType?: string | null;
   mediaFileName?: string | null;
@@ -272,12 +358,24 @@ type Message = {
   quotedBody?: string | null;
   quotedParticipant?: string | null;
   quotedFromMe?: boolean | null;
+  info?: MessageInfoPayload | null;
 };
 
 type MessageQuotePreview = {
   body: string;
   authorLabel: string;
   fromMe?: boolean | null;
+};
+
+type MessageReceipt = { id?: { _serialized?: string; user?: string } | string; t?: number };
+
+type MessageInfoPayload = {
+  delivery: MessageReceipt[];
+  deliveryRemaining: number;
+  read: MessageReceipt[];
+  readRemaining: number;
+  played: MessageReceipt[];
+  playedRemaining: number;
 };
 
 type QuickReply = {
@@ -304,6 +402,13 @@ type ChatNote = {
   createdAt: string;
   authorDisplayName: string;
   authorUsername: string;
+};
+
+type DownloadedMessageMedia = {
+  data: string;
+  mimetype: string;
+  filename: string | null;
+  filesize: number | null;
 };
 
 function lastMessageText(m: Chat["lastMessage"]): string {
@@ -433,6 +538,11 @@ function formatMessageTime(timestamp?: number) {
   return format(new Date(timestamp * 1000), "h:mm a").replace("AM", "a. m.").replace("PM", "p. m.");
 }
 
+function formatReceiptTime(timestamp?: number) {
+  if (!timestamp) return "";
+  return format(new Date(timestamp * 1000), "dd/MM h:mm a").replace("AM", "a. m.").replace("PM", "p. m.");
+}
+
 function labelColor(label?: ChatLabel) {
   return label?.color || "#f5bd31";
 }
@@ -532,6 +642,16 @@ function fileNameFromMessage(msg: Message) {
   if (msg.type === "video" || msg.mediaMimeType?.startsWith("video/")) return "Video";
   if (msg.type === "audio" || msg.mediaMimeType?.startsWith("audio/")) return "Audio";
   return "Documento";
+}
+
+function triggerDownload(href: string, fileName: string) {
+  const link = document.createElement("a");
+  link.href = href;
+  link.download = fileName;
+  link.rel = "noopener";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
 }
 
 function messageActionText(msg: Message) {
@@ -867,7 +987,17 @@ async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {
     ...init,
     headers: { ...(init?.headers || {}) },
   });
-  if (!res.ok) throw new Error(await res.text().catch(() => res.statusText));
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    let message = text || res.statusText;
+    try {
+      const parsed = JSON.parse(text) as { error?: unknown };
+      if (typeof parsed.error === "string") message = parsed.error;
+    } catch {
+      // Keep the plain text response.
+    }
+    throw new Error(message);
+  }
   return res.json() as Promise<T>;
 }
 
@@ -963,6 +1093,7 @@ function RailButton({
   href,
   tooltip,
   badge,
+  live,
   onClick,
 }: {
   children: React.ReactNode;
@@ -970,6 +1101,7 @@ function RailButton({
   href?: string;
   tooltip: string;
   badge?: number;
+  live?: boolean;
   onClick?: () => void;
 }) {
   const button = (
@@ -979,9 +1111,14 @@ function RailButton({
       aria-label={tooltip}
       className={`relative grid h-[38px] w-[38px] place-items-center rounded-full text-[#5f6f77] transition-colors hover:bg-[#e6eaed] hover:text-[#111b21] ${
         active ? "bg-[#e6eaed] text-[#111b21]" : ""
+      } ${
+        live ? "agent-live-pulse bg-[#d9fdd3] text-[#008069]" : ""
       }`}
     >
       {children}
+      {live ? (
+        <span className="absolute right-0 top-0 h-2.5 w-2.5 rounded-full border border-white bg-[#00c853] shadow-[0_0_10px_rgba(0,200,83,0.95)]" />
+      ) : null}
       {badge ? (
         <span className="absolute -right-1 -top-1 grid h-5 min-w-5 place-items-center rounded-full bg-[#0b8f6a] px-1 text-[11px] font-bold text-white">
           {badge > 99 ? "99+" : badge}
@@ -1029,9 +1166,7 @@ export default function ChatInterface() {
   const [agentSettingsOpen, setAgentSettingsOpen] = useState(false);
   const [agentEnabled, setAgentEnabled] = useState(false);
   const [agentOpenAiApiKey, setAgentOpenAiApiKey] = useState("");
-  const [agentVoiceApiKey, setAgentVoiceApiKey] = useState("");
-  const [agentModel, setAgentModel] = useState(agentModelOptions[0]);
-  const [agentCustomModel, setAgentCustomModel] = useState("");
+  const [agentModel, setAgentModel] = useState(DEFAULT_AGENT_MODEL);
   const [agentVoiceReplies, setAgentVoiceReplies] = useState(true);
   const [agentAudioToText, setAgentAudioToText] = useState(true);
   const [agentResponseScope, setAgentResponseScope] = useState<AgentResponseScope>("tagged");
@@ -1042,7 +1177,19 @@ export default function ChatInterface() {
     video: false,
     pdf: false,
   });
-  const [agentTrainingText, setAgentTrainingText] = useState("");
+  const [agentTextRules, setAgentTextRules] = useState<AgentTextRule[]>([]);
+  const [agentTextRuleEditor, setAgentTextRuleEditor] = useState<{
+    mode: "create" | "edit";
+    ruleId?: string;
+    instructions: string;
+  } | null>(null);
+  const [agentTrainingAssets, setAgentTrainingAssets] = useState<
+    Record<AgentMediaTrainingKind, AgentTrainingAsset[]>
+  >({
+    images: [],
+    video: [],
+    pdf: [],
+  });
   const [quickReplyDialogOpen, setQuickReplyDialogOpen] = useState(false);
   const [quickReplyShortcut, setQuickReplyShortcut] = useState("");
   const [quickReplyTitle, setQuickReplyTitle] = useState("");
@@ -1067,6 +1214,8 @@ export default function ChatInterface() {
   const [messageReactions, setMessageReactions] = useState<Record<string, string>>({});
   const [pinnedMessageIds, setPinnedMessageIds] = useState<string[]>([]);
   const [starredMessageIds, setStarredMessageIds] = useState<string[]>([]);
+  const [messagePinOverrides, setMessagePinOverrides] = useState<Record<string, boolean>>({});
+  const [messageStarOverrides, setMessageStarOverrides] = useState<Record<string, boolean>>({});
   const [hiddenMessageIds, setHiddenMessageIds] = useState<string[]>([]);
   const [messageQuotePreviews, setMessageQuotePreviews] = useState<Record<string, MessageQuotePreview>>({});
   const [detailsPanelOpen, setDetailsPanelOpen] = useState(false);
@@ -1087,6 +1236,7 @@ export default function ChatInterface() {
   const noteFileInputRef = useRef<HTMLInputElement>(null);
   const noteTextareaRef = useRef<HTMLTextAreaElement>(null);
   const seenSocketMessageIdsRef = useRef<Set<string>>(new Set());
+  const agentSettingsAppliedRef = useRef(false);
 
   const { data: devices } = useQuery({
     queryKey: ["devices"],
@@ -1102,6 +1252,7 @@ export default function ChatInterface() {
     queryFn: () => api<Chat[]>(`/api/devices/${sessionId}/chats`),
     enabled: !!sessionId && isDeviceReady,
     refetchInterval: 30_000,
+    retry: false,
   });
 
   const { data: labels } = useQuery<ChatLabel[]>({
@@ -1120,15 +1271,80 @@ export default function ChatInterface() {
     enabled: isAdmin,
   });
 
+  const { data: agentSettings } = useQuery<AgentSettingsResponse>({
+    queryKey: ["agent-settings"],
+    queryFn: () => api<AgentSettingsResponse>("/api/agent-settings"),
+    enabled: isAdmin,
+  });
+
+  const { data: agentModels } = useQuery<AgentModelsResponse>({
+    queryKey: ["agent-models"],
+    queryFn: () => api<AgentModelsResponse>("/api/agent-settings/models"),
+    enabled: isAdmin,
+    retry: false,
+  });
+
+  const agentModelOptions = useMemo(() => {
+    const source = agentModels?.models?.length ? agentModels.models : DEFAULT_AGENT_MODELS;
+    const list = Array.from(new Set([agentModel, ...source].filter(Boolean)));
+    return list.length > 0 ? list : DEFAULT_AGENT_MODELS;
+  }, [agentModel, agentModels?.models]);
+
+  const agentApiKeyPlaceholder = agentSettings?.apiKeyPreview
+    ? `Guardada: ${agentSettings.apiKeyPreview}. Pega una nueva para cambiarla.`
+    : agentSettings?.configured
+      ? "Key guardada. Pega una nueva para cambiarla."
+      : "sk-...";
+
   const permissionTarget = collaborators?.find((collaborator) => collaborator.id === permissionTargetId);
 
-  const { data: messages, isLoading: isMessagesLoading } = useQuery<Message[]>({
+  const buildAgentTrainingConfig = (): AgentTrainingConfigPayload => ({
+    voiceReplies: agentVoiceReplies,
+    audioToText: agentAudioToText,
+    trainingEnabled: agentTrainingEnabled,
+    responseScope: agentResponseScope,
+    selectedLabelIds: agentSelectedLabelIds,
+    textRules: agentTextRules
+      .map((rule) => ({ trigger: rule.trigger.trim(), response: rule.response.trim() }))
+      .filter((rule) => rule.trigger || rule.response),
+    assets: {
+      images: agentTrainingAssets.images.map((asset, index) => ({
+        fileName: asset.file.name,
+        mimeType: asset.file.type,
+        sizeBytes: asset.file.size,
+        trigger: asset.trigger.trim(),
+        uploadField: `images:${index}`,
+      })),
+      video: agentTrainingAssets.video.map((asset, index) => ({
+        fileName: asset.file.name,
+        mimeType: asset.file.type,
+        sizeBytes: asset.file.size,
+        trigger: asset.trigger.trim(),
+        uploadField: `video:${index}`,
+      })),
+      pdf: agentTrainingAssets.pdf.map((asset, index) => ({
+        fileName: asset.file.name,
+        mimeType: asset.file.type,
+        sizeBytes: asset.file.size,
+        trigger: asset.trigger.trim(),
+        uploadField: `pdf:${index}`,
+      })),
+    },
+  });
+
+  const {
+    data: messages,
+    isLoading: isMessagesLoading,
+    isError: isMessagesError,
+    error: messagesError,
+  } = useQuery<Message[]>({
     queryKey: ["messages", sessionId, activeChatId],
     queryFn: () =>
       api<Message[]>(
         `/api/devices/${sessionId}/chats/${encodeURIComponent(activeChatId!)}/messages?limit=100`,
       ),
     enabled: !!sessionId && !!activeChatId,
+    retry: false,
   });
 
   const { data: chatNotes } = useQuery<ChatNote[]>({
@@ -1170,22 +1386,152 @@ export default function ChatInterface() {
 	    onError: (err) => toast.error((err as Error).message),
 	  });
 
-	  const forwardMessageToChat = useMutation({
-	    mutationFn: async ({ chatId, body }: { chatId: string; body: string }) =>
-	      api<Message>(
-	        `/api/devices/${sessionId}/chats/${encodeURIComponent(chatId)}/messages`,
+	  const messageInfoMutation = useMutation({
+	    mutationFn: async (msg: Message) =>
+	      api<Message>(`/api/devices/${sessionId}/messages/info`, {
+	        method: "POST",
+	        headers: { "Content-Type": "application/json" },
+	        body: JSON.stringify({ messageId: msg.id }),
+	      }),
+	    onMutate: (msg) => {
+	      setMessageInfo(msg);
+	      setOpenMessageMenuId(null);
+	    },
+	    onSuccess: (payload) => {
+	      setMessageInfo(payload);
+	    },
+	    onError: (err) => toast.error((err as Error).message),
+	  });
+
+	  const reactToMessage = useMutation<
+	    { ok: boolean; reaction: string },
+	    Error,
+	    { msg: Message; reaction: string },
+	    { previousReaction?: string }
+	  >({
+	    mutationFn: async ({ msg, reaction }) =>
+	      api<{ ok: boolean; reaction: string }>(`/api/devices/${sessionId}/messages/react`, {
+	        method: "POST",
+	        headers: { "Content-Type": "application/json" },
+	        body: JSON.stringify({ messageId: msg.id, reaction }),
+	      }),
+	    onMutate: ({ msg, reaction }) => {
+	      const previousReaction = messageReactions[msg.id];
+	      setMessageReactions((current) => ({ ...current, [msg.id]: reaction }));
+	      setOpenMessageMenuId(null);
+	      return { previousReaction };
+	    },
+	    onError: (err, variables, context) => {
+	      setMessageReactions((current) => {
+	        const next = { ...current };
+	        if (context?.previousReaction) next[variables.msg.id] = context.previousReaction;
+	        else delete next[variables.msg.id];
+	        return next;
+	      });
+	      toast.error((err as Error).message);
+	    },
+	  });
+
+	  const downloadMessageMediaMutation = useMutation({
+	    mutationFn: async (msg: Message) => {
+	      const directHref = msg.mediaUrl || (msg.body?.startsWith("data:") ? msg.body : "");
+	      if (directHref) {
+	        return { href: directHref, filename: fileNameFromMessage(msg) };
+	      }
+	      const payload = await api<DownloadedMessageMedia>(
+	        `/api/devices/${sessionId}/messages/download`,
 	        {
 	          method: "POST",
 	          headers: { "Content-Type": "application/json" },
-	          body: JSON.stringify({ body }),
+	          body: JSON.stringify({ messageId: msg.id }),
 	        },
-	      ),
+	      );
+	      return {
+	        href: `data:${payload.mimetype};base64,${payload.data}`,
+	        filename: payload.filename || fileNameFromMessage(msg),
+	      };
+	    },
+	    onSuccess: ({ href, filename }) => {
+	      triggerDownload(href, filename);
+	      setOpenMessageMenuId(null);
+	    },
+	    onError: (err) => toast.error((err as Error).message),
+	  });
+
+	  const forwardMessageToChat = useMutation({
+	    mutationFn: async ({ chatId, messageId }: { chatId: string; messageId: string }) =>
+	      api<{ ok: boolean }>(`/api/devices/${sessionId}/messages/forward`, {
+	        method: "POST",
+	        headers: { "Content-Type": "application/json" },
+	        body: JSON.stringify({ targetChatId: chatId, messageId }),
+	      }),
 	    onSuccess: (_, variables) => {
 	      setForwardMessage(null);
 	      setForwardSearchQuery("");
 	      void queryClient.invalidateQueries({ queryKey: ["chats", sessionId] });
 	      void queryClient.invalidateQueries({ queryKey: ["messages", sessionId, variables.chatId] });
 	      toast.success("Mensaje reenviado");
+	    },
+	    onError: (err) => toast.error((err as Error).message),
+	  });
+
+	  const pinMessageMutation = useMutation({
+	    mutationFn: async ({ msg, pinned }: { msg: Message; pinned: boolean }) =>
+	      api<{ ok: boolean; pinned: boolean }>(`/api/devices/${sessionId}/messages/pin`, {
+	        method: "POST",
+	        headers: { "Content-Type": "application/json" },
+	        body: JSON.stringify({ messageId: msg.id, pinned, durationSeconds: 604800 }),
+	      }),
+	    onSuccess: (payload, variables) => {
+	      setMessagePinOverrides((current) => ({ ...current, [variables.msg.id]: payload.pinned }));
+	      setPinnedMessageIds((current) =>
+	        payload.pinned
+	          ? current.includes(variables.msg.id)
+	            ? current
+	            : [...current, variables.msg.id]
+	          : current.filter((id) => id !== variables.msg.id),
+	      );
+	      setOpenMessageMenuId(null);
+	      toast.success(payload.pinned ? "Mensaje fijado" : "Mensaje desfijado");
+	    },
+	    onError: (err) => toast.error((err as Error).message),
+	  });
+
+	  const starMessageMutation = useMutation({
+	    mutationFn: async ({ msg, starred }: { msg: Message; starred: boolean }) =>
+	      api<{ ok: boolean; starred: boolean }>(`/api/devices/${sessionId}/messages/star`, {
+	        method: "POST",
+	        headers: { "Content-Type": "application/json" },
+	        body: JSON.stringify({ messageId: msg.id, starred }),
+	      }),
+	    onSuccess: (payload, variables) => {
+	      setMessageStarOverrides((current) => ({ ...current, [variables.msg.id]: payload.starred }));
+	      setStarredMessageIds((current) =>
+	        payload.starred
+	          ? current.includes(variables.msg.id)
+	            ? current
+	            : [...current, variables.msg.id]
+	          : current.filter((id) => id !== variables.msg.id),
+	      );
+	      setOpenMessageMenuId(null);
+	      toast.success(payload.starred ? "Mensaje destacado" : "Destacado quitado");
+	    },
+	    onError: (err) => toast.error((err as Error).message),
+	  });
+
+	  const deleteMessageMutation = useMutation({
+	    mutationFn: async (msg: Message) =>
+	      api<{ ok: boolean }>(`/api/devices/${sessionId}/messages/delete`, {
+	        method: "POST",
+	        headers: { "Content-Type": "application/json" },
+	        body: JSON.stringify({ messageId: msg.id }),
+	      }),
+	    onSuccess: (_, msg) => {
+	      setHiddenMessageIds((current) => (current.includes(msg.id) ? current : [...current, msg.id]));
+	      setOpenMessageMenuId(null);
+	      toast.success("Mensaje eliminado");
+	      void queryClient.invalidateQueries({ queryKey: ["messages", sessionId, activeChatId] });
+	      void queryClient.invalidateQueries({ queryKey: ["chats", sessionId] });
 	    },
 	    onError: (err) => toast.error((err as Error).message),
 	  });
@@ -1289,6 +1635,58 @@ export default function ChatInterface() {
       setPermissionTargetId(null);
       void queryClient.invalidateQueries({ queryKey: ["collaborators"] });
       toast.success("Permisos actualizados");
+    },
+    onError: (err) => toast.error((err as Error).message),
+  });
+
+  const loadAgentModels = useMutation({
+    mutationFn: async () =>
+      api<AgentModelsResponse>("/api/agent-settings/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ openAiApiKey: agentOpenAiApiKey.trim() || undefined }),
+      }),
+    onSuccess: (payload) => {
+      queryClient.setQueryData(["agent-models"], payload);
+      if (payload.models.length > 0 && !payload.models.includes(agentModel)) {
+        setAgentModel(payload.models[0] ?? DEFAULT_AGENT_MODEL);
+      }
+      toast.success(payload.configured ? "Modelos actualizados desde OpenAI" : "Modelos base cargados");
+    },
+    onError: (err) => toast.error((err as Error).message),
+  });
+
+  const saveAgentSettings = useMutation({
+    mutationFn: async () => {
+      const trainingConfig = buildAgentTrainingConfig();
+      const formData = new FormData();
+      formData.append("settings", JSON.stringify({
+        enabled: agentEnabled,
+        openAiApiKey: agentOpenAiApiKey.trim() || undefined,
+        model: agentModel.trim() || DEFAULT_AGENT_MODEL,
+        trainingConfig,
+      }));
+      agentTrainingAssets.images.forEach((asset, index) => {
+        formData.append(`images:${index}`, asset.file, asset.file.name);
+      });
+      agentTrainingAssets.video.forEach((asset, index) => {
+        formData.append(`video:${index}`, asset.file, asset.file.name);
+      });
+      agentTrainingAssets.pdf.forEach((asset, index) => {
+        formData.append(`pdf:${index}`, asset.file, asset.file.name);
+      });
+      return api<AgentSettingsResponse>("/api/agent-settings", {
+        method: "PATCH",
+        body: formData,
+      });
+    },
+    onSuccess: (settings) => {
+      setAgentOpenAiApiKey("");
+      setAgentModel(settings.model || DEFAULT_AGENT_MODEL);
+      agentSettingsAppliedRef.current = true;
+      queryClient.setQueryData(["agent-settings"], settings);
+      void queryClient.invalidateQueries({ queryKey: ["agent-models"] });
+      toast.success(settings.enabled ? "Agente IA conectado" : "Configuración del agente guardada");
     },
     onError: (err) => toast.error((err as Error).message),
   });
@@ -1467,6 +1865,35 @@ export default function ChatInterface() {
   }, [isAdmin, leftPanel]);
 
   useEffect(() => {
+    if (!agentSettings || agentSettingsAppliedRef.current) return;
+    const config = agentSettings.trainingConfig ?? {};
+    agentSettingsAppliedRef.current = true;
+    setAgentEnabled(agentSettings.enabled);
+    setAgentModel(agentSettings.model || DEFAULT_AGENT_MODEL);
+    setAgentTrainingEnabled({
+      text: config.trainingEnabled?.text ?? true,
+      images: config.trainingEnabled?.images ?? false,
+      video: config.trainingEnabled?.video ?? false,
+      pdf: config.trainingEnabled?.pdf ?? false,
+    });
+    setAgentVoiceReplies(config.voiceReplies ?? true);
+    setAgentAudioToText(config.audioToText ?? true);
+    setAgentResponseScope(
+      config.responseScope === "notTagged" ||
+        config.responseScope === "all" ||
+        config.responseScope === "exceptTagged"
+        ? config.responseScope
+        : "tagged",
+    );
+    setAgentSelectedLabelIds(
+      Array.isArray(config.selectedLabelIds)
+        ? config.selectedLabelIds.map((id) => Number(id)).filter(Number.isFinite)
+        : [],
+    );
+    setAgentTextRules(restoreTextRules(config.textRules));
+  }, [agentSettings]);
+
+  useEffect(() => {
     if (!sessionId) return;
     if (activeChatId) {
       void fetch(`/api/devices/${sessionId}/chats/${encodeURIComponent(activeChatId)}/clear-unread`, {
@@ -1621,11 +2048,16 @@ export default function ChatInterface() {
   useEffect(() => {
     if (!agentPanelOpen) return;
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setAgentPanelOpen(false);
+      if (event.key !== "Escape") return;
+      if (agentTextRuleEditor) {
+        setAgentTextRuleEditor(null);
+        return;
+      }
+      setAgentPanelOpen(false);
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [agentPanelOpen]);
+  }, [agentPanelOpen, agentTextRuleEditor]);
 
   const addNoteFiles = (files: FileList | File[]) => {
     const incoming = Array.from(files).filter((file) => file.size > 0);
@@ -1645,10 +2077,6 @@ export default function ChatInterface() {
 	  const addPendingFiles = (files: FileList | File[]) => {
 	    if (!activeChatId) {
 	      toast.info("Selecciona un chat primero.");
-	      return;
-	    }
-	    if (activeChatBlockedByUnverifiedCode) {
-	      toast.error("Codigo no verificado por WhatsApp. No se puede enviar desde el CRM.");
 	      return;
 	    }
 	    if (!currentPermissions.canSendMedia) {
@@ -1673,17 +2101,6 @@ export default function ChatInterface() {
 	    closeMenus(setAttachmentMenuOpen, setEmojiOpen, setQuickReplyOpen);
 	  };
 
-	  const toggleMessageFlag = (
-	    setter: Dispatch<SetStateAction<string[]>>,
-	    messageId: string,
-	  ) => {
-	    setter((current) =>
-	      current.includes(messageId)
-	        ? current.filter((id) => id !== messageId)
-	        : [...current, messageId],
-	    );
-	  };
-
 		  const copyMessageText = (msg: Message) => {
 		    const text = messageActionText(msg);
 		    void navigator.clipboard?.writeText(text)
@@ -1693,31 +2110,28 @@ export default function ChatInterface() {
 		  };
 
 		  const downloadMessageMedia = (msg: Message) => {
-		    const href = msg.mediaUrl || (msg.body?.startsWith("data:") ? msg.body : "");
-		    if (!href) {
+		    if (!msg.hasMedia && !msg.mediaUrl && !msg.body?.startsWith("data:")) {
 		      toast.info("Este mensaje no tiene archivo descargable.");
 		      setOpenMessageMenuId(null);
 		      return;
 		    }
-		    const link = document.createElement("a");
-		    link.href = href;
-		    link.download = fileNameFromMessage(msg);
-		    link.rel = "noopener";
-		    document.body.appendChild(link);
-		    link.click();
-		    link.remove();
-		    setOpenMessageMenuId(null);
+		    downloadMessageMediaMutation.mutate(msg);
 		  };
 
 	  const addReactionToMessage = (msg: Message, reaction: string) => {
-	    setMessageReactions((current) => ({ ...current, [msg.id]: reaction }));
-	    setOpenMessageMenuId(null);
+	    if (!currentPermissions.canReply) {
+	      toast.error("No tienes permiso para reaccionar mensajes");
+	      return;
+	    }
+	    reactToMessage.mutate({ msg, reaction });
 	  };
 
 	  const deleteMessageLocally = (msg: Message) => {
-	    setHiddenMessageIds((current) => (current.includes(msg.id) ? current : [...current, msg.id]));
-	    setOpenMessageMenuId(null);
-	    toast.success("Mensaje eliminado de esta vista");
+	    if (!currentPermissions.canManageChats) {
+	      toast.error("No tienes permiso para eliminar mensajes");
+	      return;
+	    }
+	    deleteMessageMutation.mutate(msg);
 	  };
 
 	  const startForwardMessage = (msg: Message) => {
@@ -1731,10 +2145,6 @@ export default function ChatInterface() {
     if (!activeChatId) return;
 	    if (!currentPermissions.canReply) {
 	      toast.error("No tienes permiso para responder mensajes");
-	      return;
-	    }
-	    if (activeChatBlockedByUnverifiedCode) {
-	      toast.error("Codigo no verificado por WhatsApp. No se puede responder desde el CRM.");
 	      return;
 	    }
 	    if (containsBlockedPhoneNumber(messageInput)) {
@@ -1776,6 +2186,8 @@ export default function ChatInterface() {
   const unreadTotal = chats?.reduce((count, chat) => count + Math.max(chat.unreadCount, 0), 0) ?? 0;
   const selectedLabel = labels?.find((label) => label.id === selectedLabelId) ?? null;
   const agentSelectedLabels = labels?.filter((label) => agentSelectedLabelIds.includes(label.id)) ?? [];
+  const canLoadAgentModels = !!agentOpenAiApiKey.trim() || !!agentSettings?.configured;
+  const agentIsLive = agentEnabled && !!agentSettings?.configured;
 
   const toggleAgentLabel = (labelId: number) => {
     setAgentSelectedLabelIds((current) =>
@@ -1785,6 +2197,71 @@ export default function ChatInterface() {
 
   const toggleAgentTraining = (key: AgentTrainingKind) => {
     setAgentTrainingEnabled((current) => ({ ...current, [key]: !current[key] }));
+  };
+
+  const openAgentTextRuleEditor = (rule?: AgentTextRule) => {
+    setAgentTextRuleEditor({
+      mode: rule ? "edit" : "create",
+      ruleId: rule?.id,
+      instructions: rule ? rule.response || rule.trigger : "",
+    });
+  };
+
+  const saveAgentTextRule = () => {
+    if (!agentTextRuleEditor) return;
+    const instructions = agentTextRuleEditor.instructions.trim();
+    if (!instructions) {
+      toast.error("Agrega instrucciones de tu negocio.");
+      return;
+    }
+    if (agentTextRuleEditor.mode === "edit" && agentTextRuleEditor.ruleId) {
+      setAgentTextRules((current) =>
+        current.map((rule) =>
+          rule.id === agentTextRuleEditor.ruleId
+            ? { ...rule, trigger: "Información del negocio", response: instructions }
+            : rule,
+        ),
+      );
+      toast.success("Regla actualizada");
+    } else {
+      setAgentTextRules((current) => [
+        ...current,
+        { id: localId("rule"), trigger: "Información del negocio", response: instructions },
+      ]);
+      toast.success("Regla guardada");
+    }
+    setAgentTextRuleEditor(null);
+  };
+
+  const removeAgentTextRule = (id: string) => {
+    const firstConfirmation = window.confirm("¿Está seguro de eliminar esta regla?");
+    if (!firstConfirmation) return;
+    const secondConfirmation = window.confirm("Confirmación final: esta regla se eliminará. ¿Deseas continuar?");
+    if (!secondConfirmation) return;
+    setAgentTextRules((current) => current.filter((rule) => rule.id !== id));
+    toast.success("Regla eliminada");
+  };
+
+  const addAgentTrainingAsset = (kind: AgentMediaTrainingKind, file?: File | null) => {
+    if (!file) return;
+    setAgentTrainingAssets((current) => ({
+      ...current,
+      [kind]: [...current[kind], { id: localId(kind), file, trigger: "" }],
+    }));
+  };
+
+  const updateAgentTrainingAsset = (kind: AgentMediaTrainingKind, id: string, trigger: string) => {
+    setAgentTrainingAssets((current) => ({
+      ...current,
+      [kind]: current[kind].map((asset) => (asset.id === id ? { ...asset, trigger } : asset)),
+    }));
+  };
+
+  const removeAgentTrainingAsset = (kind: AgentMediaTrainingKind, id: string) => {
+    setAgentTrainingAssets((current) => ({
+      ...current,
+      [kind]: current[kind].filter((asset) => asset.id !== id),
+    }));
   };
 
   const visibleChats = useMemo(() => {
@@ -1821,7 +2298,6 @@ export default function ChatInterface() {
 
 	  const archivedCount = chats?.filter((c) => c.archived).length ?? 0;
 	  const activeChat = chats?.find((c) => c.id === activeChatId);
-	  const activeChatBlockedByUnverifiedCode = !!activeChat && !activeChat.isGroup && !verifiedChatDigits(activeChat);
 	  const activeChatName = displayChatCode(activeChat);
 	  const activeChatFullName = displayChatName(activeChat);
 	  const headerLabel = activeChat?.labels?.[0] ?? null;
@@ -1995,6 +2471,149 @@ export default function ChatInterface() {
     }
   };
 
+  const selectChat = (chatId: string) => {
+    setActiveChatId(chatId);
+    closeMenus(
+      setLabelMenuOpen,
+      setAppMenuOpen,
+      setChatMenuOpen,
+      setHeaderLabelsOpen,
+      setAttachmentMenuOpen,
+      setEmojiOpen,
+      setQuickReplyOpen,
+    );
+  };
+
+  const renderChatRowMenuItems = (
+    chat: Chat,
+    labelIdsOnChat: Set<number>,
+    parts: {
+      Item: React.ElementType;
+      Separator: React.ElementType;
+      Sub: React.ElementType;
+      SubTrigger: React.ElementType;
+      SubContent: React.ElementType;
+    },
+  ) => {
+    const { Item, Separator, Sub, SubTrigger, SubContent } = parts;
+    return (
+      <>
+        <Item
+          onSelect={() =>
+            mutateChatState.mutate({
+              chat,
+              patch: { archived: !chat.archived },
+            })
+          }
+        >
+          {chat.archived ? (
+            <>
+              <ArchiveRestore className="mr-2 h-4 w-4" /> Desarchivar chat
+            </>
+          ) : (
+            <>
+              <Archive className="mr-2 h-4 w-4" /> Archivar chat
+            </>
+          )}
+        </Item>
+        <Item onSelect={() => toast.info("Restricción preparada para este chat.")}>
+          <Briefcase className="mr-2 h-4 w-4" /> Restringir chat
+        </Item>
+        <Item
+          onSelect={() =>
+            mutateChatState.mutate({
+              chat,
+              patch: { muted: !chat.muted },
+            })
+          }
+        >
+          <VolumeX className={`mr-2 h-4 w-4 ${chat.muted ? "text-[#008069]" : ""}`} />
+          {chat.muted ? "Reactivar notificaciones" : "Silenciar notificaciones"}
+        </Item>
+        <Item
+          onSelect={() =>
+            mutateChatState.mutate({
+              chat,
+              patch: { pinned: !chat.pinned },
+            })
+          }
+        >
+          <Pin className="mr-2 h-4 w-4" /> {chat.pinned ? "Desfijar chat" : "Fijar chat"}
+        </Item>
+        <Item
+          onSelect={() =>
+            mutateChatState.mutate({
+              chat,
+              patch: { favorited: !chat.favorited },
+            })
+          }
+        >
+          <Star className={`mr-2 h-4 w-4 ${chat.favorited ? "fill-amber-400 text-amber-400" : ""}`} />
+          {chat.favorited ? "Quitar destacado" : "Destacar chat"}
+        </Item>
+        <Sub>
+          <SubTrigger>
+            <Tag className="mr-2 h-4 w-4" /> Etiquetar chat
+          </SubTrigger>
+          <SubContent className="w-56">
+            {labels && labels.length > 0 ? (
+              labels.map((l) => (
+                <Item
+                  key={l.id}
+                  className="flex items-center gap-2"
+                  disabled={!currentPermissions.canManageLabels || toggleLabelOnChat.isPending}
+                  onSelect={() => {
+                    toggleLabelOnChat.mutate({
+                      chat,
+                      labelId: l.id,
+                      attached: labelIdsOnChat.has(l.id),
+                    });
+                  }}
+                >
+                  <span className="inline-block h-3 w-3 rounded-sm" style={{ backgroundColor: l.color }} />
+                  <span className="min-w-0 flex-1 truncate">{l.name}</span>
+                  <span
+                    className={`grid h-5 w-5 place-items-center rounded border ${
+                      labelIdsOnChat.has(l.id)
+                        ? "border-[#111b21] bg-[#111b21] text-white"
+                        : "border-[#9aa3a9] bg-white"
+                    }`}
+                  >
+                    {labelIdsOnChat.has(l.id) ? <Check className="h-3.5 w-3.5" /> : null}
+                  </span>
+                </Item>
+              ))
+            ) : (
+              <Item disabled>Sin etiquetas</Item>
+            )}
+            <Separator />
+            <Link href="/labels">
+              <Item>
+                <Tags className="mr-2 h-4 w-4" /> Gestionar etiquetas
+              </Item>
+            </Link>
+          </SubContent>
+        </Sub>
+        <Item onSelect={() => mutateChatState.mutate({ chat, patch: { manuallyUnread: true } })}>
+          <MailPlus className="mr-2 h-4 w-4" /> Marcar como no leído
+        </Item>
+        <Separator />
+        <Item onSelect={() => toast.info("Bloqueo disponible desde WhatsApp.")}>
+          <Ban className="mr-2 h-4 w-4" /> Bloquear
+        </Item>
+        <Item onSelect={() => toast.info("Vaciar chat no borra mensajes en WhatsApp desde este panel.")}>
+          <Eraser className="mr-2 h-4 w-4" /> Vaciar chat
+        </Item>
+        <Item
+          className="text-[#b42318] focus:text-[#b42318]"
+          onSelect={() => toast.info("No se pueden eliminar conversaciones desde el CRM.")}
+        >
+          <Trash2 className="mr-2 h-4 w-4" /> Eliminar chat
+        </Item>
+      </>
+    );
+  };
+
   const attachmentItems: Array<{
     label: string;
     icon: React.ReactNode;
@@ -2065,6 +2684,7 @@ export default function ChatInterface() {
         <div className="mt-auto flex flex-col items-center gap-2">
           <RailButton
             active={agentPanelOpen}
+            live={agentIsLive}
             tooltip="Agente IA"
             onClick={() => {
               setAgentPanelOpen(true);
@@ -2590,13 +3210,17 @@ export default function ChatInterface() {
                 return (
                   <ContextMenu key={chat.id}>
                     <ContextMenuTrigger asChild>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setActiveChatId(chat.id);
-                          closeMenus(setLabelMenuOpen, setAppMenuOpen, setChatMenuOpen, setHeaderLabelsOpen, setAttachmentMenuOpen, setEmojiOpen, setQuickReplyOpen);
+                      <div
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => selectChat(chat.id)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault();
+                            selectChat(chat.id);
+                          }
                         }}
-                        className={`group grid w-full min-w-0 max-w-full grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 overflow-hidden rounded-lg px-3 py-2.5 text-left transition-colors ${
+                        className={`group grid w-full min-w-0 max-w-full cursor-pointer grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 overflow-hidden rounded-lg px-3 py-2.5 text-left transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[#00a884] ${
                           selected ? "bg-[#eef0f1]" : "hover:bg-[#f3f4f4]"
                         }`}
                       >
@@ -2647,133 +3271,51 @@ export default function ChatInterface() {
                                 {badge > 99 ? "99+" : badge}
                               </span>
                             ) : null}
-                            <ChevronDown className="h-4 w-4 text-[#667781] opacity-0 transition-opacity group-hover:opacity-100" />
+                            <DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                <button
+                                  type="button"
+                                  className="grid h-6 w-6 place-items-center rounded-full text-[#667781] opacity-0 transition-opacity hover:bg-[#e9edef] hover:text-[#111b21] focus:opacity-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#00a884] group-hover:opacity-100 data-[state=open]:opacity-100"
+                                  aria-label={`Acciones de ${visibleName}`}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    closeMenus(
+                                      setLabelMenuOpen,
+                                      setAppMenuOpen,
+                                      setChatMenuOpen,
+                                      setHeaderLabelsOpen,
+                                      setAttachmentMenuOpen,
+                                      setEmojiOpen,
+                                      setQuickReplyOpen,
+                                    );
+                                  }}
+                                  onKeyDown={(event) => event.stopPropagation()}
+                                >
+                                  <ChevronDown className="h-4 w-4" />
+                                </button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align="end" sideOffset={6} className="w-64">
+                                {renderChatRowMenuItems(chat, labelIdsOnChat, {
+                                  Item: DropdownMenuItem,
+                                  Separator: DropdownMenuSeparator,
+                                  Sub: DropdownMenuSub,
+                                  SubTrigger: DropdownMenuSubTrigger,
+                                  SubContent: DropdownMenuSubContent,
+                                })}
+                              </DropdownMenuContent>
+                            </DropdownMenu>
                           </div>
                         </div>
-                      </button>
+                      </div>
                     </ContextMenuTrigger>
-                    <ContextMenuContent className="w-60">
-                      <ContextMenuItem
-                        onSelect={() =>
-                          mutateChatState.mutate({ chat, patch: { manuallyUnread: true } })
-                        }
-                      >
-                        <MailPlus className="mr-2 h-4 w-4" /> Marcar como no leído
-                      </ContextMenuItem>
-                      <ContextMenuItem
-                        onSelect={() =>
-                          mutateChatState.mutate({
-                            chat,
-                            patch: { archived: !chat.archived },
-                          })
-                        }
-                      >
-                        {chat.archived ? (
-                          <>
-                            <ArchiveRestore className="mr-2 h-4 w-4" /> Desarchivar
-                          </>
-                        ) : (
-                          <>
-                            <Archive className="mr-2 h-4 w-4" /> Archivar
-                          </>
-                        )}
-                      </ContextMenuItem>
-                      <ContextMenuItem onSelect={() => toast.info("Restricción preparada para este chat.")}>
-                        <Briefcase className="mr-2 h-4 w-4" /> Restringir chat
-                      </ContextMenuItem>
-                      <ContextMenuItem
-                        onSelect={() =>
-                          mutateChatState.mutate({
-                            chat,
-                            patch: { muted: !chat.muted },
-                          })
-                        }
-                      >
-                        <VolumeX className={`mr-2 h-4 w-4 ${chat.muted ? "text-[#008069]" : ""}`} />
-                        {chat.muted ? "Reactivar notificaciones" : "Silenciar notificaciones"}
-                      </ContextMenuItem>
-                      <ContextMenuItem
-                        onSelect={() =>
-                          mutateChatState.mutate({
-                            chat,
-                            patch: { pinned: !chat.pinned },
-                          })
-                        }
-                      >
-                        <Pin className="mr-2 h-4 w-4" /> {chat.pinned ? "Desfijar chat" : "Fijar chat"}
-                      </ContextMenuItem>
-                      <ContextMenuItem
-                        onSelect={() =>
-                          mutateChatState.mutate({
-                            chat,
-                            patch: { favorited: !chat.favorited },
-                          })
-                        }
-                      >
-                        <Star
-                          className={`mr-2 h-4 w-4 ${chat.favorited ? "fill-amber-400 text-amber-400" : ""}`}
-                        />
-                        {chat.favorited ? "Quitar destacado" : "Destacar"}
-                      </ContextMenuItem>
-                      <ContextMenuSeparator />
-                      <ContextMenuSub>
-                        <ContextMenuSubTrigger>
-                          <Tag className="mr-2 h-4 w-4" /> Etiquetas
-                        </ContextMenuSubTrigger>
-                        <ContextMenuSubContent className="w-56">
-                          {labels && labels.length > 0 ? (
-                            labels.map((l) => (
-                              <ContextMenuItem
-                                key={l.id}
-                                className="flex items-center gap-2"
-                                disabled={!currentPermissions.canManageLabels || toggleLabelOnChat.isPending}
-                                onSelect={() => {
-                                  toggleLabelOnChat.mutate({
-                                    chat,
-                                    labelId: l.id,
-                                    attached: labelIdsOnChat.has(l.id),
-                                  });
-                                }}
-                              >
-                                <span
-                                  className="inline-block h-3 w-3 rounded-sm"
-                                  style={{ backgroundColor: l.color }}
-                                />
-                                <span className="min-w-0 flex-1 truncate">{l.name}</span>
-                                <span
-                                  className={`grid h-5 w-5 place-items-center rounded border ${
-                                    labelIdsOnChat.has(l.id)
-                                      ? "border-[#111b21] bg-[#111b21] text-white"
-                                      : "border-[#9aa3a9] bg-white"
-                                  }`}
-                                >
-                                  {labelIdsOnChat.has(l.id) ? <Check className="h-3.5 w-3.5" /> : null}
-                                </span>
-                              </ContextMenuItem>
-                            ))
-                          ) : (
-                            <ContextMenuItem disabled>
-                              Sin etiquetas -{" "}
-                              <Link href="/labels" className="ml-1 underline">
-                                crear
-                              </Link>
-                            </ContextMenuItem>
-                          )}
-                          <ContextMenuSeparator />
-                          <Link href="/labels">
-                            <ContextMenuItem>
-                              <Tags className="mr-2 h-4 w-4" /> Gestionar etiquetas
-                            </ContextMenuItem>
-                          </Link>
-                        </ContextMenuSubContent>
-                      </ContextMenuSub>
-                      <ContextMenuSeparator />
-                      <ContextMenuItem onSelect={() => toast.info("Bloqueo disponible desde WhatsApp.")}>
-                        <Ban className="mr-2 h-4 w-4" /> Bloquear
-                      </ContextMenuItem>
-                      <ContextMenuItem onSelect={() => toast.info("Vaciar chat no borra mensajes en WhatsApp desde este panel.")}>
-                        <Eraser className="mr-2 h-4 w-4" /> Vaciar chat
-                      </ContextMenuItem>
+                    <ContextMenuContent className="w-64">
+                      {renderChatRowMenuItems(chat, labelIdsOnChat, {
+                        Item: ContextMenuItem,
+                        Separator: ContextMenuSeparator,
+                        Sub: ContextMenuSub,
+                        SubTrigger: ContextMenuSubTrigger,
+                        SubContent: ContextMenuSubContent,
+                      })}
                     </ContextMenuContent>
                   </ContextMenu>
                 );
@@ -3003,13 +3545,17 @@ export default function ChatInterface() {
                 <div className="my-2 self-center rounded-lg bg-white px-4 py-1.5 text-[13px] font-semibold text-[#667781] shadow-sm">
                   Hoy
                 </div>
-                {isMessagesLoading ? (
-                  <div className="self-center rounded-lg bg-white/90 px-4 py-3 text-[#667781] shadow-sm">
-                    Cargando mensajes...
-                  </div>
-	                ) : activeMessages.length === 0 ? (
-                  <div className="self-center rounded-lg bg-[#fff5c4] px-4 py-3 text-sm text-[#5f5500] shadow-sm">
-                    Envía un mensaje para iniciar.
+	                {isMessagesLoading ? (
+	                  <div className="self-center rounded-lg bg-white/90 px-4 py-3 text-[#667781] shadow-sm">
+	                    Cargando mensajes...
+	                  </div>
+		                ) : isMessagesError ? (
+		                  <div className="self-center rounded-lg border border-[#f0d3a1] bg-[#fff8e8] px-4 py-3 text-sm text-[#7a4d00] shadow-sm">
+		                    No se pudieron cargar los mensajes. {(messagesError as Error)?.message || ""}
+		                  </div>
+		                ) : activeMessages.length === 0 ? (
+	                  <div className="self-center rounded-lg bg-[#fff5c4] px-4 py-3 text-sm text-[#5f5500] shadow-sm">
+	                    Envía un mensaje para iniciar.
                   </div>
                 ) : (
 		                  activeMessages.map((msg) => {
@@ -3033,8 +3579,8 @@ export default function ChatInterface() {
 	                    const messageTime = formatMessageTime(msg.timestamp);
 	                    const authorCode = (msg.author ? participantDigitsById.get(msg.author) : "") || trustedDigitsFromWaId(msg.author);
 		                    const messageReaction = messageReactions[msg.id];
-		                    const messagePinned = pinnedMessageIds.includes(msg.id);
-		                    const messageStarred = starredMessageIds.includes(msg.id);
+		                    const messagePinned = messagePinOverrides[msg.id] ?? pinnedMessageIds.includes(msg.id);
+		                    const messageStarred = messageStarOverrides[msg.id] ?? msg.isStarred ?? starredMessageIds.includes(msg.id);
 		                    const quotedParticipantDigits =
 		                      (msg.quotedParticipant ? participantDigitsById.get(msg.quotedParticipant) : "") ||
 		                      trustedDigitsFromWaId(msg.quotedParticipant);
@@ -3081,11 +3627,11 @@ export default function ChatInterface() {
 	                              className="fixed inset-0 z-40 cursor-default bg-transparent"
 	                              onClick={() => setOpenMessageMenuId(null)}
 	                            />
-		                            <div
-		                              className={`absolute top-8 z-50 w-[245px] overflow-hidden rounded-xl border border-[#e8ecef] bg-white shadow-[0_14px_38px_rgba(11,20,26,0.18)] ${
-		                                "right-0"
-		                              }`}
-		                            >
+			                            <div
+			                              className={`absolute top-8 z-50 w-[245px] overflow-hidden rounded-xl border border-[#e8ecef] bg-white shadow-[0_14px_38px_rgba(11,20,26,0.18)] ${
+			                                msg.fromMe ? "right-0" : "left-0"
+			                              }`}
+			                            >
 	                              <div className="flex items-center gap-1 border-b border-[#eef0f2] px-2 py-1.5">
 	                                {["👍", "❤️", "😂", "😮", "😢", "🙏"].map((reaction) => (
 	                                  <button
@@ -3112,10 +3658,7 @@ export default function ChatInterface() {
 	                                  key: "info",
 	                                  label: "Info. del mensaje",
 	                                  icon: <Info className="h-4 w-4" />,
-	                                  onClick: () => {
-	                                    setMessageInfo(msg);
-	                                    setOpenMessageMenuId(null);
-	                                  },
+	                                  onClick: () => messageInfoMutation.mutate(msg),
 	                                },
 	                                {
 	                                  key: "reply",
@@ -3139,7 +3682,7 @@ export default function ChatInterface() {
 		                                  icon: <Smile className="h-4 w-4" />,
 		                                  onClick: () => addReactionToMessage(msg, "👍"),
 		                                },
-		                                ...(msg.mediaUrl || msg.body?.startsWith("data:")
+		                                ...(msg.hasMedia || msg.mediaUrl || msg.body?.startsWith("data:")
 		                                  ? [
 		                                      {
 		                                        key: "download",
@@ -3160,8 +3703,11 @@ export default function ChatInterface() {
 	                                  label: messagePinned ? "Desfijar" : "Fijar",
 	                                  icon: <Pin className="h-4 w-4" />,
 	                                  onClick: () => {
-	                                    toggleMessageFlag(setPinnedMessageIds, msg.id);
-	                                    setOpenMessageMenuId(null);
+	                                    if (!currentPermissions.canManageChats) {
+	                                      toast.error("No tienes permiso para fijar mensajes");
+	                                      return;
+	                                    }
+	                                    pinMessageMutation.mutate({ msg, pinned: !messagePinned });
 	                                  },
 	                                },
 	                                {
@@ -3169,8 +3715,11 @@ export default function ChatInterface() {
 	                                  label: messageStarred ? "Quitar destacado" : "Destacar",
 	                                  icon: <Star className="h-4 w-4" />,
 	                                  onClick: () => {
-	                                    toggleMessageFlag(setStarredMessageIds, msg.id);
-	                                    setOpenMessageMenuId(null);
+	                                    if (!currentPermissions.canManageChats) {
+	                                      toast.error("No tienes permiso para destacar mensajes");
+	                                      return;
+	                                    }
+	                                    starMessageMutation.mutate({ msg, starred: !messageStarred });
 	                                  },
 	                                },
 	                                {
@@ -3506,19 +4055,10 @@ export default function ChatInterface() {
 	                  ))}
 	                </div>
 	              ) : null}
-	              {activeChatBlockedByUnverifiedCode ? (
-	                <div className="mx-auto mb-3 max-w-[1320px] rounded-xl border border-[#f0b3b3] bg-[#fff4f4] px-4 py-3 text-[13px] font-semibold text-[#b42318]">
-	                  Codigo no verificado por WhatsApp. No se puede responder desde el CRM.
-	                </div>
-	              ) : null}
 	              <form onSubmit={handleSend} className="mx-auto flex max-w-[1320px] items-end gap-3">
 	                <button
 	                  type="button"
 	                  onClick={() => {
-	                    if (activeChatBlockedByUnverifiedCode) {
-	                      toast.error("Codigo no verificado por WhatsApp. No se puede enviar desde el CRM.");
-	                      return;
-	                    }
 	                    if (!currentPermissions.canSendMedia && !currentPermissions.canUseQuickReplies) {
 	                      toast.error("No tienes permiso para enviar adjuntos");
 	                      return;
@@ -3526,7 +4066,7 @@ export default function ChatInterface() {
                     setAttachmentMenuOpen((v) => !v);
 	                    closeMenus(setLabelMenuOpen, setAppMenuOpen, setChatMenuOpen, setHeaderLabelsOpen, setEmojiOpen, setQuickReplyOpen);
 	                  }}
-	                  disabled={activeChatBlockedByUnverifiedCode || (!currentPermissions.canSendMedia && !currentPermissions.canUseQuickReplies)}
+	                  disabled={!currentPermissions.canSendMedia && !currentPermissions.canUseQuickReplies}
 	                  className={`grid h-12 w-12 shrink-0 place-items-center rounded-full bg-white text-[#111b21] shadow-sm hover:bg-[#f5f6f6] ${
 	                    attachmentMenuOpen ? "text-[#008069]" : ""
 	                  } disabled:cursor-not-allowed disabled:opacity-45`}
@@ -3558,13 +4098,9 @@ export default function ChatInterface() {
                         handleSend(e);
                       }
                     }}
-	                    disabled={activeChatBlockedByUnverifiedCode || !currentPermissions.canReply}
+	                    disabled={!currentPermissions.canReply}
 	                    placeholder={
-	                      activeChatBlockedByUnverifiedCode
-	                        ? "Codigo no verificado"
-	                        : currentPermissions.canReply
-	                          ? "Escribe un mensaje"
-	                          : "Sin permiso para responder"
+	                      currentPermissions.canReply ? "Escribe un mensaje" : "Sin permiso para responder"
 	                    }
 	                    className="h-7 max-h-32 min-h-7 w-full resize-none bg-transparent text-[18px] leading-7 text-[#111b21] outline-none placeholder:text-[#7a7f83]"
 	                    rows={1}
@@ -3573,7 +4109,7 @@ export default function ChatInterface() {
                 <Button
                   type="submit"
                   size="icon"
-	                  disabled={sendMessage.isPending || sendMediaFiles.isPending || activeChatBlockedByUnverifiedCode || !currentPermissions.canReply}
+	                  disabled={sendMessage.isPending || sendMediaFiles.isPending || !currentPermissions.canReply}
                   className={`h-12 w-12 shrink-0 rounded-full shadow-sm disabled:opacity-60 ${
                     messageInput.trim() || pendingFiles.length > 0
                       ? "bg-[#111b21] text-white hover:bg-[#222e35]"
@@ -3592,41 +4128,48 @@ export default function ChatInterface() {
           </>
         )}
       </main>
-      {agentPanelOpen ? (
-        <div
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-[#111b21]/45 px-4 py-6 backdrop-blur-[2px]"
-          role="dialog"
-          aria-modal="true"
-          aria-label="Agente IA"
-          onClick={() => setAgentPanelOpen(false)}
-        >
-          <div
-            onClick={(event) => event.stopPropagation()}
-            className="flex max-h-[88vh] w-full max-w-[980px] flex-col overflow-hidden rounded-[22px] bg-white shadow-[0_28px_90px_rgba(11,20,26,0.38)]"
-          >
-            <header className="flex h-[64px] shrink-0 items-center gap-3 border-b border-[#e4e7e8] px-5">
-              <span className="grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[#e5f6ef] text-[25px]">
-                🙋
-              </span>
+	      {agentPanelOpen ? (
+	        <div
+	          className="fixed inset-0 z-[100] bg-[#f6f7f7]"
+	          role="dialog"
+	          aria-modal="true"
+	          aria-label="Agente IA"
+	        >
+	          <div
+	            className="flex h-full w-full flex-col overflow-hidden bg-white"
+	          >
+	            <header className="flex h-[72px] shrink-0 items-center gap-3 border-b border-[#e4e7e8] bg-white px-5 md:px-8">
+		              <span className={`relative grid h-11 w-11 shrink-0 place-items-center rounded-full bg-[#e5f6ef] text-[25px] ${
+		                agentIsLive ? "agent-live-pulse text-[#008069]" : ""
+		              }`}>
+		                🙋
+                    {agentIsLive ? (
+                      <span className="absolute right-0 top-0 h-2.5 w-2.5 rounded-full border border-white bg-[#00c853] shadow-[0_0_10px_rgba(0,200,83,0.95)]" />
+                    ) : null}
+	              </span>
               <div className="min-w-0 flex-1">
-                <h2 className="truncate text-[19px] font-semibold text-[#111b21]">Agente IA</h2>
-                <p className="truncate text-[12px] font-semibold text-[#667781]">
-                  {agentEnabled ? "Activo para responder clientes" : "Pausado"}
-                </p>
+	                <h2 className="truncate text-[19px] font-semibold text-[#111b21]">Agente IA</h2>
+	                <p className="truncate text-[12px] font-semibold text-[#667781]">
+	                  {agentEnabled
+	                    ? agentSettings?.configured
+	                      ? "Activo para responder clientes"
+	                      : "Falta conectar OpenAI"
+	                    : "Pausado"}
+	                </p>
               </div>
-              <button
-                type="button"
-                onClick={() => setAgentSettingsOpen((value) => !value)}
-                className={`grid h-10 w-10 place-items-center rounded-full border transition-colors ${
+	              <button
+	                type="button"
+	                onClick={() => setAgentSettingsOpen((value) => !value)}
+	                className={`grid h-10 w-10 place-items-center rounded-full border transition-colors ${
                   agentSettingsOpen
                     ? "border-[#008069] bg-[#e5f6ef] text-[#008069]"
                     : "border-[#d1d7db] text-[#54656f] hover:bg-[#f0f2f5]"
                 }`}
                 aria-label="Configuración del agente"
               >
-                <Settings className="h-5 w-5" />
-              </button>
-              <button
+	                <Settings className="h-5 w-5" />
+	              </button>
+	              <button
                 type="button"
                 onClick={() => setAgentPanelOpen(false)}
                 className="grid h-10 w-10 place-items-center rounded-full text-[#667781] hover:bg-[#f0f2f5] hover:text-[#111b21]"
@@ -3636,15 +4179,15 @@ export default function ChatInterface() {
               </button>
             </header>
 
-            <div
-              className={`grid min-h-0 flex-1 grid-cols-1 overflow-hidden ${
-                agentSettingsOpen ? "lg:grid-cols-[minmax(0,1fr)_320px]" : ""
-              }`}
-            >
-              <ScrollArea className="min-h-0">
-                <div className="space-y-5 p-5">
-                  <section className="grid gap-3 md:grid-cols-3">
-                    <label className="flex min-h-[78px] cursor-pointer items-center gap-3 rounded-xl border border-[#dce3df] bg-[#fbfbfa] px-4">
+	            <div
+	              className={`grid min-h-0 flex-1 grid-cols-1 overflow-hidden bg-[#f6f7f7] ${
+	                agentSettingsOpen ? "lg:grid-cols-[minmax(0,1fr)_390px]" : ""
+	              }`}
+	            >
+	              <ScrollArea className="min-h-0">
+	                <div className="mx-auto max-w-[1480px] space-y-6 p-5 md:p-8">
+	                  <section className="grid gap-3 md:grid-cols-3">
+	                    <label className="flex min-h-[78px] cursor-pointer items-center gap-3 rounded-xl border border-[#dce3df] bg-[#fbfbfa] px-4">
                       <input
                         type="checkbox"
                         checked={agentEnabled}
@@ -3689,9 +4232,12 @@ export default function ChatInterface() {
                         {agentTrainingCards.filter((card) => agentTrainingEnabled[card.key]).length} activos
                       </span>
                     </div>
-                    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                      {agentTrainingCards.map((card) => (
-                        <div key={card.key} className="flex min-h-[228px] flex-col rounded-xl border border-[#e4e7e8] bg-white p-4 shadow-sm">
+	                    <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+	                      {agentTrainingCards.map((card) => {
+	                        const mediaKey = card.key === "text" ? null : card.key;
+	                        const mediaAssets = mediaKey ? agentTrainingAssets[mediaKey] : [];
+	                        return (
+	                        <div key={card.key} className="flex min-h-[300px] flex-col rounded-xl border border-[#e4e7e8] bg-white p-4 shadow-sm">
                           <div className="mb-3 flex items-start justify-between gap-2">
                             <div className="min-w-0">
                               <div className="truncate text-[16px] font-semibold text-[#111b21]">
@@ -3716,34 +4262,141 @@ export default function ChatInterface() {
                               />
                             </button>
                           </div>
-                          {card.key === "text" ? (
-                            <textarea
-                              value={agentTrainingText}
-                              onChange={(event) => setAgentTrainingText(event.target.value)}
-                              placeholder="Escribe reglas, tono y respuestas frecuentes."
-                              className="min-h-[88px] flex-1 resize-none rounded-lg border border-[#d1d7db] px-3 py-2 text-[13px] leading-5 outline-none focus:border-[#008069]"
-                            />
-                          ) : (
-                            <label className="grid min-h-[88px] flex-1 cursor-pointer place-items-center rounded-lg border border-dashed border-[#cfd8dc] bg-[#fbfbfa] px-3 py-4 text-center text-[13px] font-semibold text-[#54656f] hover:bg-[#f5f6f6]">
-                              <input type="file" className="hidden" accept={card.accept} multiple />
-                              Cargar {card.title.toLowerCase()}
-                            </label>
-                          )}
+	                          {card.key === "text" ? (
+	                            <div className="flex min-h-0 flex-1 flex-col gap-3">
+	                              <button
+	                                type="button"
+	                                onClick={() => openAgentTextRuleEditor()}
+	                                className="inline-flex h-10 w-full items-center justify-center gap-2 rounded-full border border-[#d1d7db] bg-white px-4 text-[13px] font-semibold text-[#111b21] hover:bg-[#f5f6f6]"
+	                              >
+	                                <Plus className="h-4 w-4" />
+	                                Agregar regla
+	                              </button>
+	                              <div className="max-h-[280px] space-y-2 overflow-y-auto pr-1">
+	                                {agentTextRules.length === 0 ? (
+	                                  <div className="grid min-h-[116px] place-items-center rounded-lg border border-dashed border-[#dce3df] bg-[#fbfbfa] px-3 text-center text-[12px] font-semibold text-[#8696a0]">
+	                                    Sin instrucciones guardadas.
+	                                  </div>
+	                                ) : (
+	                                  agentTextRules.map((rule, index) => {
+	                                    const instructions = rule.response || rule.trigger;
+	                                    return (
+	                                      <div key={rule.id} className="rounded-lg border border-[#e4e7e8] bg-[#fbfbfa] p-3">
+	                                        <div className="mb-2 flex items-center justify-between gap-2">
+	                                          <div className="flex min-w-0 items-center gap-2">
+	                                            <span className="grid h-6 min-w-6 place-items-center rounded-full bg-[#e5f6ef] px-1 text-[11px] font-bold text-[#008069]">
+	                                              {index + 1}
+	                                            </span>
+	                                            <span className="truncate text-[12px] font-semibold text-[#111b21]">
+	                                              Información del negocio
+	                                            </span>
+	                                          </div>
+	                                          <div className="flex shrink-0 items-center gap-1">
+	                                            <button
+	                                              type="button"
+	                                              onClick={() => openAgentTextRuleEditor(rule)}
+	                                              className="grid h-7 w-7 place-items-center rounded-full text-[#667781] hover:bg-white hover:text-[#111b21]"
+	                                              aria-label="Editar regla"
+	                                            >
+	                                              <Pencil className="h-3.5 w-3.5" />
+	                                            </button>
+	                                            <button
+	                                              type="button"
+	                                              onClick={() => removeAgentTextRule(rule.id)}
+	                                              className="grid h-7 w-7 place-items-center rounded-full text-[#b42318] hover:bg-white"
+	                                              aria-label="Eliminar regla"
+	                                            >
+	                                              <Trash2 className="h-3.5 w-3.5" />
+	                                            </button>
+	                                          </div>
+	                                        </div>
+	                                        <p className="max-h-[64px] overflow-hidden text-[12px] leading-5 text-[#54656f]">
+	                                          {instructions}
+	                                        </p>
+	                                      </div>
+	                                    );
+	                                  })
+	                                )}
+	                              </div>
+	                            </div>
+	                          ) : mediaKey ? (
+	                            <div className="flex min-h-0 flex-1 flex-col gap-2">
+	                              <label className="flex h-11 cursor-pointer items-center justify-center gap-2 rounded-lg border border-dashed border-[#cfd8dc] bg-[#fbfbfa] px-3 text-[12px] font-semibold text-[#54656f] hover:bg-[#f5f6f6]">
+	                                <input
+	                                  type="file"
+	                                  className="hidden"
+	                                  accept={card.accept}
+	                                  onChange={(event) => {
+	                                    addAgentTrainingAsset(mediaKey, event.currentTarget.files?.[0]);
+	                                    event.currentTarget.value = "";
+	                                  }}
+	                                />
+	                                <Plus className="h-4 w-4" />
+	                                {mediaKey === "images" ? "Agregar imagen" : mediaKey === "video" ? "Agregar video" : "Agregar PDF"}
+	                              </label>
+	                              <div className="max-h-[280px] space-y-2 overflow-y-auto pr-1">
+	                                {mediaAssets.length === 0 ? (
+	                                  <div className="grid min-h-[116px] place-items-center rounded-lg border border-dashed border-[#dce3df] bg-[#fbfbfa] px-3 text-center text-[12px] font-semibold text-[#8696a0]">
+	                                    Cargar {card.title.toLowerCase()}
+	                                  </div>
+	                                ) : (
+	                                  mediaAssets.map((asset, index) => (
+	                                    <div key={asset.id} className="rounded-lg border border-[#e4e7e8] bg-[#fbfbfa] p-2">
+	                                      <div className="mb-2 flex items-center gap-2">
+	                                        <span className={`grid h-8 min-w-8 place-items-center rounded-md px-1 text-[10px] font-bold text-white ${fileBadge(asset.file.name, asset.file.type).color}`}>
+	                                          {fileBadge(asset.file.name, asset.file.type).label}
+	                                        </span>
+	                                        <div className="min-w-0 flex-1">
+	                                          <div className="truncate text-[12px] font-semibold text-[#111b21]">
+	                                            {index + 1}. {asset.file.name}
+	                                          </div>
+	                                          <div className="text-[10px] font-semibold text-[#8696a0]">
+	                                            {formatFileSize(asset.file.size)}
+	                                          </div>
+	                                        </div>
+	                                        <button
+	                                          type="button"
+	                                          onClick={() => removeAgentTrainingAsset(mediaKey, asset.id)}
+	                                          className="grid h-7 w-7 place-items-center rounded-full text-[#8696a0] hover:bg-white hover:text-[#111b21]"
+	                                          aria-label="Eliminar archivo"
+	                                        >
+	                                          <X className="h-4 w-4" />
+	                                        </button>
+	                                      </div>
+	                                      <input
+	                                        value={asset.trigger}
+	                                        onChange={(event) => updateAgentTrainingAsset(mediaKey, asset.id, event.target.value)}
+	                                        placeholder={
+	                                          mediaKey === "images"
+	                                            ? "Disparador: enviar imagen cuando..."
+	                                            : mediaKey === "video"
+	                                              ? "Disparador: enviar video cuando..."
+	                                              : "Disparador: enviar PDF cuando..."
+	                                        }
+	                                        className="h-9 w-full rounded-lg border border-[#d1d7db] bg-white px-3 text-[12px] outline-none placeholder:text-[#8696a0] focus:border-[#008069]"
+	                                      />
+	                                    </div>
+	                                  ))
+	                                )}
+	                              </div>
+	                            </div>
+	                          ) : null}
                         </div>
-                      ))}
+	                        );
+	                      })}
                     </div>
                   </section>
 
-                  <section className="rounded-xl border border-[#dce3df] bg-[#fbfbfa] p-4">
-                    <h3 className="text-[16px] font-semibold text-[#111b21]">Flujo de voz</h3>
-                    <div className="mt-3 grid gap-2 sm:grid-cols-3">
+	                  <section className="mt-12 border-t border-[#e4e7e8] pt-4">
+                    <h3 className="text-[12px] font-semibold uppercase tracking-wide text-[#667781]">Flujo de voz</h3>
+                    <div className="mt-3 flex flex-wrap items-center gap-x-10 gap-y-2">
                       {[
                         "Recibir audio",
                         agentAudioToText ? "Transcribir a texto" : "Omitir transcripción",
                         agentVoiceReplies ? "Responder en voz o texto" : "Responder solo texto",
                       ].map((step, index) => (
-                        <div key={step} className="flex items-center gap-2 rounded-lg bg-white px-3 py-2 text-[13px] font-semibold text-[#111b21]">
-                          <span className="grid h-6 w-6 shrink-0 place-items-center rounded-full bg-[#e5f6ef] text-[12px] text-[#008069]">
+                        <div key={step} className="flex min-w-[210px] items-center gap-2 text-[12px] font-semibold text-[#3b4a54]">
+                          <span className="grid h-5 w-5 shrink-0 place-items-center rounded-full bg-[#e5f6ef] text-[11px] text-[#008069]">
                             {index + 1}
                           </span>
                           <span className="min-w-0 truncate">{step}</span>
@@ -3754,8 +4407,8 @@ export default function ChatInterface() {
                 </div>
               </ScrollArea>
 
-              <aside className={`${agentSettingsOpen ? "flex" : "hidden"} min-h-0 flex-col border-l border-[#e4e7e8] bg-[#f7f8f8]`}>
-                <div className="shrink-0 border-b border-[#e4e7e8] px-4 py-4">
+	              <aside className={`${agentSettingsOpen ? "flex" : "hidden"} min-h-0 flex-col border-l border-[#e4e7e8] bg-white`}>
+	                <div className="shrink-0 border-b border-[#e4e7e8] px-5 py-5">
                   <div className="flex items-center gap-2 text-[16px] font-semibold text-[#111b21]">
                     <Settings className="h-4 w-4" />
                     Configuración
@@ -3765,7 +4418,7 @@ export default function ChatInterface() {
                   </div>
                 </div>
                 <ScrollArea className="min-h-0 flex-1">
-                  <div className="space-y-3 p-4">
+	                  <div className="space-y-4 p-5">
                     {agentResponseScopeOptions.map((option) => (
                       <label
                         key={option.key}
@@ -3829,62 +4482,130 @@ export default function ChatInterface() {
               </aside>
             </div>
 
-            <footer className="grid shrink-0 gap-3 border-t border-[#e4e7e8] bg-white px-5 py-4 md:grid-cols-[minmax(0,1fr)_220px_220px_auto_auto]">
-              <label className="min-w-0">
-                <span className="mb-1 block text-[12px] font-semibold text-[#54656f]">API de OpenAI</span>
-                <input
-                  value={agentOpenAiApiKey}
-                  onChange={(event) => setAgentOpenAiApiKey(event.target.value)}
-                  type="password"
-                  placeholder="sk-..."
-                  className="h-10 w-full rounded-lg border border-[#d1d7db] px-3 text-[13px] outline-none focus:border-[#008069]"
-                />
-              </label>
-              <label className="min-w-0">
-                <span className="mb-1 block text-[12px] font-semibold text-[#54656f]">Modelo</span>
-                <select
-                  value={agentModel}
-                  onChange={(event) => setAgentModel(event.target.value)}
-                  className="h-10 w-full rounded-lg border border-[#d1d7db] bg-white px-3 text-[13px] outline-none focus:border-[#008069]"
-                >
-                  {agentModelOptions.map((model) => (
-                    <option key={model} value={model}>
-                      {model}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="min-w-0">
-                <span className="mb-1 block text-[12px] font-semibold text-[#54656f]">
-                  {agentModel === "Modelo personalizado" ? "Nombre del modelo" : "API de voz"}
-                </span>
-                <input
-                  value={agentModel === "Modelo personalizado" ? agentCustomModel : agentVoiceApiKey}
-                  onChange={(event) =>
-                    agentModel === "Modelo personalizado"
-                      ? setAgentCustomModel(event.target.value)
-                      : setAgentVoiceApiKey(event.target.value)
-                  }
-                  type={agentModel === "Modelo personalizado" ? "text" : "password"}
-                  placeholder={agentModel === "Modelo personalizado" ? "modelo" : "voz..."}
-                  className="h-10 w-full rounded-lg border border-[#d1d7db] px-3 text-[13px] outline-none focus:border-[#008069]"
-                />
-              </label>
-              <button
-                type="button"
-                onClick={() => setAgentSettingsOpen(true)}
-                className="h-10 rounded-lg border border-[#d1d7db] px-4 text-[13px] font-semibold text-[#54656f] hover:bg-[#f5f6f6]"
-              >
-                Siguiente
-              </button>
-              <button
-                type="button"
-                onClick={() => toast.success("Configuración del agente guardada")}
-                className="h-10 rounded-lg bg-[#008069] px-4 text-[13px] font-semibold text-white hover:bg-[#027a62]"
-              >
-                Guardar
-              </button>
-            </footer>
+            {agentTextRuleEditor ? (
+              <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/35 px-4">
+                <div className="flex max-h-[82dvh] w-full max-w-[760px] flex-col overflow-hidden rounded-2xl bg-white shadow-[0_24px_80px_rgba(11,20,26,0.28)] lg:w-[50vw]">
+                  <header className="flex shrink-0 items-center justify-between gap-3 border-b border-[#eef0f2] px-5 py-4">
+                    <div className="min-w-0">
+                      <h3 className="truncate text-[18px] font-semibold text-[#111b21]">
+                        {agentTextRuleEditor.mode === "edit" ? "Editar regla" : "Agregar regla"}
+                      </h3>
+                      <p className="mt-1 text-[12px] leading-4 text-[#667781]">
+                        Agrega instrucciones e información de tu negocio para el agente.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setAgentTextRuleEditor(null)}
+                      className="grid h-9 w-9 shrink-0 place-items-center rounded-full text-[#667781] hover:bg-[#f0f2f5] hover:text-[#111b21]"
+                      aria-label="Cerrar regla"
+                    >
+                      <X className="h-5 w-5" />
+                    </button>
+                  </header>
+                  <div className="min-h-0 flex-1 p-5">
+                    <label className="block text-[13px] font-semibold text-[#111b21]">
+                      Instrucciones del negocio
+                    </label>
+                    <textarea
+                      value={agentTextRuleEditor.instructions}
+                      onChange={(event) =>
+                        setAgentTextRuleEditor((current) =>
+                          current ? { ...current, instructions: event.target.value } : current,
+                        )
+                      }
+                      onKeyDown={(event) => {
+                        if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                          event.preventDefault();
+                          saveAgentTextRule();
+                        }
+                      }}
+                      placeholder="Escribe aquí información de tu negocio: horarios, precios, servicios, políticas, forma de atención y cualquier instrucción que debe seguir el agente."
+                      className="mt-2 min-h-[300px] w-full resize-none rounded-xl border border-[#d1d7db] bg-white px-4 py-3 text-[14px] leading-6 text-[#111b21] outline-none placeholder:text-[#8696a0] focus:border-[#008069] lg:min-h-[360px]"
+                      autoFocus
+                    />
+                  </div>
+                  <footer className="flex shrink-0 justify-end gap-2 border-t border-[#eef0f2] px-5 py-4">
+                    <button
+                      type="button"
+                      onClick={() => setAgentTextRuleEditor(null)}
+                      className="h-10 rounded-lg border border-[#d1d7db] px-4 text-[13px] font-semibold text-[#54656f] hover:bg-[#f5f6f6]"
+                    >
+                      Cancelar
+                    </button>
+                    <button
+                      type="button"
+                      onClick={saveAgentTextRule}
+                      className="h-10 rounded-lg bg-[#008069] px-5 text-[13px] font-semibold text-white hover:bg-[#027a62]"
+                    >
+                      Guardar
+                    </button>
+                  </footer>
+                </div>
+              </div>
+            ) : null}
+
+	            <footer className="grid shrink-0 gap-3 border-t border-[#e4e7e8] bg-white px-5 py-4 md:grid-cols-[minmax(220px,1fr)_minmax(180px,260px)_auto] md:px-8">
+	              <label className="min-w-0">
+	                <span className="mb-1 block text-[12px] font-semibold text-[#54656f]">API key de OpenAI</span>
+	                <div className="relative">
+	                  <input
+	                    value={agentOpenAiApiKey}
+	                    onChange={(event) => setAgentOpenAiApiKey(event.target.value)}
+	                    type="password"
+		                    placeholder={agentApiKeyPlaceholder}
+	                    className="h-10 w-full rounded-lg border border-[#d1d7db] px-3 pr-28 text-[13px] outline-none focus:border-[#008069]"
+	                  />
+	                  <span
+	                    className={`pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 rounded-full px-2 py-1 text-[11px] font-semibold ${
+	                      agentSettings?.configured
+	                        ? "bg-[#e5f6ef] text-[#008069]"
+	                        : "bg-[#f0f2f5] text-[#667781]"
+	                    }`}
+	                  >
+	                    {agentSettings?.configured ? "Configurado" : "Pendiente"}
+	                  </span>
+	                </div>
+	              </label>
+		              <div className="min-w-0">
+		                <div className="mb-1 flex items-center justify-between gap-2">
+		                  <label htmlFor="agent-model-select" className="block text-[12px] font-semibold text-[#54656f]">
+		                    Modelo
+		                  </label>
+		                  <button
+		                    type="button"
+		                    onClick={() => loadAgentModels.mutate()}
+		                    disabled={loadAgentModels.isPending || !canLoadAgentModels}
+		                    className="rounded-full px-2 py-0.5 text-[11px] font-semibold text-[#008069] hover:bg-[#e5f6ef] disabled:cursor-not-allowed disabled:text-[#aebac1] disabled:hover:bg-transparent"
+		                  >
+		                    {loadAgentModels.isPending ? "Cargando" : "Actualizar"}
+		                  </button>
+		                </div>
+		                <div className="relative">
+		                  <select
+		                    id="agent-model-select"
+		                    value={agentModel}
+		                    onChange={(event) => setAgentModel(event.target.value)}
+		                    className="h-10 w-full appearance-none rounded-lg border border-[#d1d7db] bg-white px-3 pr-9 text-[13px] outline-none focus:border-[#008069]"
+		                  >
+		                    {agentModelOptions.map((model) => (
+		                      <option key={model} value={model}>
+		                        {model}
+		                      </option>
+		                    ))}
+		                  </select>
+		                  <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#667781]" />
+		                </div>
+		              </div>
+	              <button
+	                type="button"
+	                onClick={() => saveAgentSettings.mutate()}
+	                disabled={saveAgentSettings.isPending}
+	                className="h-10 self-end rounded-lg bg-[#008069] px-5 text-[13px] font-semibold text-white hover:bg-[#027a62] disabled:cursor-not-allowed disabled:opacity-60"
+	              >
+	                {saveAgentSettings.isPending ? "Conectando" : "Guardar"}
+	              </button>
+	            </footer>
           </div>
         </div>
       ) : null}
@@ -3999,21 +4720,15 @@ export default function ChatInterface() {
               <div className="p-2">
                 {forwardTargets.length > 0 ? (
                   forwardTargets.map((chat) => {
-                    const targetBlocked = !chat.isGroup && !verifiedChatDigits(chat);
                     const targetLabel = displayChatCode(chat);
                     const targetName = displayChatName(chat);
                     return (
                       <button
                         key={chat.id}
                         type="button"
-                        disabled={targetBlocked || forwardMessageToChat.isPending || !currentPermissions.canReply}
+                        disabled={forwardMessageToChat.isPending || !currentPermissions.canReply}
                         onClick={() => {
-                          const body = `Reenviado\n${messageActionText(forwardMessage)}`.slice(0, 3900);
-                          if (containsBlockedPhoneNumber(body)) {
-                            toast.error(blockedPhoneNumberMessage);
-                            return;
-                          }
-                          forwardMessageToChat.mutate({ chatId: chat.id, body });
+                          forwardMessageToChat.mutate({ chatId: chat.id, messageId: forwardMessage.id });
                         }}
                         className="flex min-h-[60px] w-full items-center gap-3 rounded-xl px-3 text-left hover:bg-[#f5f6f6] disabled:cursor-not-allowed disabled:opacity-45"
                       >
@@ -4026,9 +4741,7 @@ export default function ChatInterface() {
                         />
                         <div className="min-w-0 flex-1">
                           <div className="truncate text-[15px] font-semibold text-[#111b21]">{targetLabel}</div>
-                          <div className="truncate text-[12px] text-[#667781]">
-                            {targetBlocked ? "Codigo no verificado" : targetName}
-                          </div>
+                          <div className="truncate text-[12px] text-[#667781]">{targetName}</div>
                         </div>
                         <Send className="h-4 w-4 shrink-0 text-[#008069]" />
                       </button>
@@ -4084,7 +4797,31 @@ export default function ChatInterface() {
                 <span className="truncate font-semibold text-[#111b21]">
                   {messageInfo.hasMedia ? fileNameFromMessage(messageInfo) : "Sin archivo"}
                 </span>
+                {messageInfo.isForwarded ? (
+                  <>
+                    <span>Estado</span>
+                    <span className="font-semibold text-[#111b21]">Reenviado</span>
+                  </>
+                ) : null}
               </div>
+              {messageInfoMutation.isPending ? (
+                <div className="rounded-xl border border-[#eef0f2] px-3 py-2 text-[12px] font-semibold text-[#667781]">
+                  Consultando WhatsApp...
+                </div>
+              ) : messageInfo.info ? (
+                <div className="grid grid-cols-[112px_1fr] gap-y-2 rounded-xl border border-[#eef0f2] px-3 py-2 text-[12px] text-[#54656f]">
+                  <span>Entregado</span>
+                  <span className="font-semibold text-[#111b21]">
+                    {messageInfo.info.delivery.length}
+                    {messageInfo.info.delivery[0]?.t ? ` - ${formatReceiptTime(messageInfo.info.delivery[0].t)}` : ""}
+                  </span>
+                  <span>Leído</span>
+                  <span className="font-semibold text-[#111b21]">
+                    {messageInfo.info.read.length}
+                    {messageInfo.info.read[0]?.t ? ` - ${formatReceiptTime(messageInfo.info.read[0].t)}` : ""}
+                  </span>
+                </div>
+              ) : null}
               <div className="break-all rounded-xl border border-[#eef0f2] px-3 py-2 font-mono text-[11px] text-[#667781]">
                 {messageInfo.id}
               </div>

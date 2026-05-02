@@ -7,6 +7,7 @@ import chatStateRouter from "./chat-state";
 import chatNotesRouter from "./chat-notes";
 import quickRepliesRouter from "./quick-replies";
 import collaboratorsRouter from "./collaborators";
+import agentSettingsRouter from "./agent-settings";
 
 const router: IRouter = Router();
 
@@ -18,5 +19,6 @@ router.use(chatStateRouter);
 router.use(chatNotesRouter);
 router.use(quickRepliesRouter);
 router.use(collaboratorsRouter);
+router.use(agentSettingsRouter);
 
 export default router;
