@@ -1,0 +1,20 @@
+import { Router, type IRouter } from "express";
+import healthRouter from "./health";
+import authRouter from "./auth";
+import devicesRouter from "./devices";
+import labelsRouter from "./labels";
+import chatStateRouter from "./chat-state";
+import quickRepliesRouter from "./quick-replies";
+import collaboratorsRouter from "./collaborators";
+
+const router: IRouter = Router();
+
+router.use(healthRouter);
+router.use(authRouter);
+router.use(devicesRouter);
+router.use(labelsRouter);
+router.use(chatStateRouter);
+router.use(quickRepliesRouter);
+router.use(collaboratorsRouter);
+
+export default router;
