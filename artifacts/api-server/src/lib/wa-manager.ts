@@ -155,7 +155,7 @@ function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForMainFrame(page: PuppeteerPageLike, timeoutMs = 5000) {
+async function waitForMainFrame(page: PuppeteerPageLike, timeoutMs = 30_000) {
   const startedAt = Date.now();
   let lastError: unknown;
 
@@ -187,10 +187,10 @@ function patchPuppeteerLaunchForWhatsApp() {
       if (pages[0]) {
         try {
           await waitForMainFrame(pages[0]);
-          return pages;
         } catch (err) {
-          logger.warn({ err }, "initial Chromium page was not ready; opening a fresh page");
+          logger.warn({ err }, "initial Chromium page was not ready before timeout; using the existing page");
         }
+        return pages;
       }
 
       if (typeof browser.newPage === "function") {
@@ -482,6 +482,8 @@ class WAManager {
       puppeteer: {
         headless: true,
         executablePath: resolveBrowserExecutablePath(),
+        timeout: 120_000,
+        protocolTimeout: 120_000,
         args: [
           "--no-sandbox",
           "--disable-setuid-sandbox",
