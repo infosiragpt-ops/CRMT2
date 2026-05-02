@@ -3,6 +3,7 @@ import bcrypt from "bcryptjs";
 import { db, usersTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
 import { requireAuth } from "../lib/auth";
+import { ensureBootstrapAdminRole, isBootstrapAdminUsername } from "../lib/bootstrap-admin";
 import { normalizePermissions } from "../lib/permissions";
 
 const router: IRouter = Router();
@@ -14,6 +15,9 @@ router.post("/auth/register", async (req, res) => {
   }
   const cleanUsername = username.toLowerCase().trim();
   const cleanDisplay = (typeof displayName === "string" && displayName.trim()) || cleanUsername;
+  if (isBootstrapAdminUsername(cleanUsername)) {
+    return res.status(403).json({ error: "Reserved administrator account" });
+  }
   const existing = await db.select().from(usersTable).where(eq(usersTable.username, cleanUsername));
   if (existing.length) return res.status(409).json({ error: "Username already taken" });
 
@@ -42,12 +46,19 @@ router.post("/auth/login", async (req, res) => {
   if (!user) return res.status(401).json({ error: "Invalid credentials" });
   const ok = await bcrypt.compare(password, user.passwordHash);
   if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+  const effectiveUser = await ensureBootstrapAdminRole(user);
   req.session.regenerate((err) => {
     if (err) return res.status(500).json({ error: "Session error" });
-    req.session.userId = user.id;
-    req.session.userRole = user.role as "admin" | "user";
+    req.session.userId = effectiveUser.id;
+    req.session.userRole = effectiveUser.role as "admin" | "user";
     req.session.save(() => {
-      res.json({ id: user.id, username: user.username, displayName: user.displayName, role: user.role, permissions: normalizePermissions(user.permissions) });
+      res.json({
+        id: effectiveUser.id,
+        username: effectiveUser.username,
+        displayName: effectiveUser.displayName,
+        role: effectiveUser.role,
+        permissions: normalizePermissions(effectiveUser.permissions),
+      });
     });
   });
 });
@@ -62,7 +73,15 @@ router.post("/auth/logout", (req, res) => {
 router.get("/auth/me", requireAuth, async (req, res) => {
   const [user] = await db.select().from(usersTable).where(eq(usersTable.id, req.session.userId!));
   if (!user) return res.status(401).json({ error: "Unauthorized" });
-  res.json({ id: user.id, username: user.username, displayName: user.displayName, role: user.role, permissions: normalizePermissions(user.permissions) });
+  const effectiveUser = await ensureBootstrapAdminRole(user);
+  req.session.userRole = effectiveUser.role as "admin" | "user";
+  res.json({
+    id: effectiveUser.id,
+    username: effectiveUser.username,
+    displayName: effectiveUser.displayName,
+    role: effectiveUser.role,
+    permissions: normalizePermissions(effectiveUser.permissions),
+  });
 });
 
 export default router;

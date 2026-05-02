@@ -5,6 +5,7 @@ import { attachSocket } from "./lib/socket";
 import { db, devicesTable } from "@workspace/db";
 import { inArray } from "drizzle-orm";
 import { waManager } from "./lib/wa-manager";
+import { ensureBootstrapAdmin } from "./lib/bootstrap-admin";
 
 const rawPort = process.env["PORT"];
 if (!rawPort) throw new Error("PORT environment variable is required but was not provided.");
@@ -34,7 +35,16 @@ async function restoreConnectedDevices() {
   }
 }
 
-server.listen(port, () => {
-  logger.info({ port }, "Server listening");
-  void restoreConnectedDevices();
+async function start() {
+  await ensureBootstrapAdmin();
+
+  server.listen(port, () => {
+    logger.info({ port }, "Server listening");
+    void restoreConnectedDevices();
+  });
+}
+
+void start().catch((err) => {
+  logger.fatal({ err }, "failed to start server");
+  process.exit(1);
 });
