@@ -1,5 +1,7 @@
 import path from "node:path";
 import fs from "node:fs";
+import { accessSync, constants as fsConstants } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { logger } from "./logger";
 import {
   db,
@@ -61,6 +63,78 @@ interface DeviceState {
   profileName?: string;
   deviceRowId?: number;
   activeChatId?: string; // chat the operator currently has open (suppresses unread bump)
+  lastError?: string;
+}
+
+let resolvedBrowserExecutablePath: string | undefined | null;
+
+function canExecute(filePath: string | undefined | null): filePath is string {
+  if (!filePath) return false;
+  try {
+    accessSync(filePath, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function findExecutableOnPath(names: string[]) {
+  const pathDirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+  for (const dir of pathDirs) {
+    for (const name of names) {
+      const candidate = path.join(dir, name);
+      if (canExecute(candidate)) return candidate;
+    }
+  }
+
+  for (const name of names) {
+    try {
+      const candidate = execFileSync("which", [name], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+      if (canExecute(candidate)) return candidate;
+    } catch {
+      // Continue through the candidate list.
+    }
+  }
+  return null;
+}
+
+function resolveBrowserExecutablePath() {
+  if (resolvedBrowserExecutablePath !== undefined) return resolvedBrowserExecutablePath ?? undefined;
+
+  const configuredPath = process.env.PUPPETEER_EXECUTABLE_PATH?.trim();
+  if (canExecute(configuredPath)) {
+    resolvedBrowserExecutablePath = configuredPath;
+    return configuredPath;
+  }
+
+  if (configuredPath) {
+    logger.warn({ configuredPath }, "configured Chromium path is not executable; falling back to auto-detection");
+  }
+
+  const knownPaths = [
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/run/current-system/sw/bin/chromium",
+    "/nix/var/nix/profiles/default/bin/chromium",
+  ];
+  const knownPath = knownPaths.find(canExecute);
+  if (knownPath) {
+    resolvedBrowserExecutablePath = knownPath;
+    return knownPath;
+  }
+
+  const pathCandidate = findExecutableOnPath(["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"]);
+  resolvedBrowserExecutablePath = pathCandidate;
+  if (!pathCandidate) {
+    logger.warn("Chromium executable not found; WhatsApp QR generation will fail until Chromium is available");
+  }
+  return pathCandidate ?? undefined;
+}
+
+function errorMessage(err: unknown) {
+  return err instanceof Error ? err.message : String(err);
 }
 
 function sanitizeFileName(value: string) {
@@ -289,7 +363,13 @@ class WAManager {
   getState(sessionId: string): Omit<DeviceState, "client" | "deviceRowId" | "activeChatId"> | null {
     const s = this.devices.get(sessionId);
     if (!s) return null;
-    return { status: s.status, qrDataUrl: s.qrDataUrl, phoneNumber: s.phoneNumber, profileName: s.profileName };
+    return {
+      status: s.status,
+      qrDataUrl: s.qrDataUrl,
+      phoneNumber: s.phoneNumber,
+      profileName: s.profileName,
+      lastError: s.lastError,
+    };
   }
 
   hasClient(sessionId: string): boolean {
@@ -309,9 +389,14 @@ class WAManager {
   private async doStart(sessionId: string): Promise<void> {
     if (this.devices.has(sessionId)) {
       const s = this.devices.get(sessionId)!;
-      if (s.qrDataUrl) this.emit(sessionId, "qr", { qr: s.qrDataUrl });
-      this.emit(sessionId, "status", { status: s.status });
-      return;
+      if (s.status === "auth_failure" || s.status === "disconnected") {
+        try { await s.client.destroy(); } catch { /* noop */ }
+        this.devices.delete(sessionId);
+      } else {
+        if (s.qrDataUrl) this.emit(sessionId, "qr", { qr: s.qrDataUrl });
+        this.emit(sessionId, "status", { status: s.status, error: s.lastError });
+        return;
+      }
     }
 
     const { Client, LocalAuth } = require("whatsapp-web.js") as {
@@ -323,7 +408,7 @@ class WAManager {
       authStrategy: new LocalAuth({ clientId: sessionId, dataPath: SESSIONS_DIR }),
       puppeteer: {
         headless: true,
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH,
+        executablePath: resolveBrowserExecutablePath(),
         args: [
           "--no-sandbox",
           "--disable-setuid-sandbox",
@@ -353,6 +438,7 @@ class WAManager {
         const dataUrl = await QRCode.toDataURL(qr, { width: 320, margin: 1 });
         state.qrDataUrl = dataUrl;
         state.status = "qr";
+        state.lastError = undefined;
         this.emit(sessionId, "qr", { qr: dataUrl });
         this.emit(sessionId, "status", { status: "qr" });
         await db.update(devicesTable).set({ status: "qr" }).where(eq(devicesTable.sessionId, sessionId));
@@ -364,18 +450,21 @@ class WAManager {
     client.on("authenticated", async () => {
       state.status = "authenticated";
       state.qrDataUrl = undefined;
+      state.lastError = undefined;
       this.emit(sessionId, "status", { status: "authenticated" });
       await db.update(devicesTable).set({ status: "authenticated" }).where(eq(devicesTable.sessionId, sessionId));
     });
 
     client.on("auth_failure", async (msg: string) => {
       state.status = "auth_failure";
+      state.lastError = msg;
       this.emit(sessionId, "status", { status: "auth_failure", error: msg });
       await db.update(devicesTable).set({ status: "auth_failure" }).where(eq(devicesTable.sessionId, sessionId));
     });
 
     client.on("ready", async () => {
       state.status = "ready";
+      state.lastError = undefined;
       state.phoneNumber = client.info?.wid.user;
       state.profileName = client.info?.pushname;
       this.emit(sessionId, "status", { status: "ready", phoneNumber: state.phoneNumber, profileName: state.profileName });
@@ -389,7 +478,8 @@ class WAManager {
 
     client.on("disconnected", async (reason: string) => {
       state.status = "disconnected";
-      this.emit(sessionId, "status", { status: "disconnected", reason });
+      state.lastError = reason;
+      this.emit(sessionId, "status", { status: "disconnected", reason, error: reason });
       await db.update(devicesTable).set({ status: "disconnected" }).where(eq(devicesTable.sessionId, sessionId));
       this.devices.delete(sessionId);
     });
@@ -403,10 +493,12 @@ class WAManager {
     });
 
     client.initialize().catch((err) => {
-      logger.error({ err, sessionId }, "WA client initialize failed");
-      state.status = "disconnected";
-      this.emit(sessionId, "status", { status: "disconnected", error: String(err) });
-      this.devices.delete(sessionId);
+      const message = errorMessage(err);
+      logger.error({ err, sessionId, chromiumPath: resolveBrowserExecutablePath() }, "WA client initialize failed");
+      state.status = "auth_failure";
+      state.lastError = message;
+      this.emit(sessionId, "status", { status: "auth_failure", error: message });
+      void db.update(devicesTable).set({ status: "auth_failure" }).where(eq(devicesTable.sessionId, sessionId));
     });
   }
 

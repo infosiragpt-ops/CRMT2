@@ -276,6 +276,20 @@ router.delete("/devices/:sessionId", requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
+router.get("/devices/:sessionId/connection-state", async (req, res) => {
+  const device = await findDeviceBySessionForUser(req.session.userId!, String(req.params.sessionId));
+  if (!device) return res.status(404).json({ error: "Not found" });
+  const state = waManager.getState(device.sessionId);
+  res.json({
+    sessionId: device.sessionId,
+    status: state?.status ?? device.status,
+    qr: state?.qrDataUrl ?? null,
+    phoneNumber: state?.phoneNumber ?? device.phoneNumber ?? null,
+    profileName: state?.profileName ?? device.profileName ?? null,
+    error: state?.lastError ?? null,
+  });
+});
+
 router.get("/devices/:sessionId/chats", async (req, res) => {
   const sessionIdParam = String(req.params.sessionId);
   const device = (await findDeviceBySessionForUser(req.session.userId!, sessionIdParam)) as DeviceRow | null;

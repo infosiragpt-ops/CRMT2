@@ -28,31 +28,74 @@ export default function DeviceConnect() {
   useEffect(() => {
     if (!socket || !sessionId) return;
 
-    socket.emit("subscribe-device", sessionId);
+    let cancelled = false;
 
-    socket.on("qr", (data: { sessionId: string; qr: string }) => {
+    const applyStatus = (data: { sessionId?: string; status: string; error?: string | null; qr?: string | null }) => {
+      if (data.sessionId && data.sessionId !== sessionId) return;
+      if (cancelled) return;
+      setStatus(data.status);
+      if (data.qr) setQrCode(data.qr);
+      if (data.error) setError(data.error);
+
+      if (data.status === "ready") {
+        setTimeout(() => {
+          if (!cancelled) setLocation(`/devices/${sessionId}`);
+        }, 1000);
+      }
+    };
+
+    const pollConnectionState = async () => {
+      const res = await fetch(`/api/devices/${sessionId}/connection-state`, { credentials: "include" });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      applyStatus(data);
+    };
+
+    const handleQr = (data: { sessionId: string; qr: string }) => {
       if (data.sessionId === sessionId) {
         setQrCode(data.qr);
         setStatus("qr");
       }
-    });
+    };
 
-    socket.on("status", (data: { sessionId: string; status: string; error?: string }) => {
-      if (data.sessionId === sessionId) {
-        setStatus(data.status);
-        if (data.error) setError(data.error);
-        
-        if (data.status === "ready") {
-          setTimeout(() => {
-            setLocation(`/devices/${sessionId}`);
-          }, 1000);
+    const handleStatus = (data: { sessionId: string; status: string; error?: string }) => {
+      applyStatus(data);
+    };
+
+    socket.on("qr", handleQr);
+    socket.on("status", handleStatus);
+    socket.emit("subscribe-device", sessionId);
+
+    const startConnection = async () => {
+      try {
+        setError(null);
+        setStatus("starting");
+        const res = await fetch(`/api/devices/${sessionId}/start`, {
+          method: "POST",
+          credentials: "include",
+        });
+        if (!res.ok) throw new Error(await res.text());
+        await pollConnectionState();
+      } catch (err) {
+        if (!cancelled) {
+          setStatus("auth_failure");
+          setError(err instanceof Error ? err.message : String(err));
         }
       }
-    });
+    };
+
+    void startConnection();
+    const pollId = window.setInterval(() => {
+      if (cancelled) return;
+      void pollConnectionState().catch(() => undefined);
+    }, 2500);
 
     return () => {
-      socket.off("qr");
-      socket.off("status");
+      cancelled = true;
+      window.clearInterval(pollId);
+      socket.emit("unsubscribe-device", sessionId);
+      socket.off("qr", handleQr);
+      socket.off("status", handleStatus);
     };
   }, [socket, sessionId, setLocation]);
 
