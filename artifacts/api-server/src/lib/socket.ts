@@ -5,7 +5,7 @@ import { waManager } from "./wa-manager";
 import { logger } from "./logger";
 import { findDeviceBySessionForUser } from "./chats";
 import { isConfiguredOrLocalOrigin, isTrustedOrigin } from "./http-security";
-import { onInternalMessage } from "./internal-message-events";
+import { onCollaboratorsUpdated, onInternalMessage, onInternalRead } from "./internal-message-events";
 import { markUserOffline, markUserOnline } from "./presence";
 
 export function attachSocket(server: HttpServer): IOServer {
@@ -33,6 +33,22 @@ export function attachSocket(server: HttpServer): IOServer {
       .emit("internal-message", { message });
   });
 
+  onInternalRead(({ readerUserId, peerUserId, readAt }) => {
+    io.to(`user:${readerUserId}`)
+      .to(`user:${peerUserId}`)
+      .emit("internal-read", { readerUserId, peerUserId, readAt });
+  });
+
+  onCollaboratorsUpdated((event) => {
+    if (event.userIds?.length) {
+      for (const userId of event.userIds) {
+        io.to(`user:${userId}`).emit("collaborators-updated", event);
+      }
+      return;
+    }
+    io.emit("collaborators-updated", event);
+  });
+
   io.use((socket, next) => {
     const req = socket.request as any;
     const userId = req?.session?.userId;
@@ -49,6 +65,7 @@ export function attachSocket(server: HttpServer): IOServer {
     const subs = new Map<string, () => void>();
     socket.join(`user:${userId}`);
     markUserOnline(userId);
+    io.emit("collaborators-updated", { reason: "presence", userIds: [userId] });
     logger.info({ userId, sid: socket.id }, "socket connected");
 
     socket.on("subscribe-device", async (sessionId: string) => {
@@ -87,6 +104,7 @@ export function attachSocket(server: HttpServer): IOServer {
       for (const off of subs.values()) off();
       subs.clear();
       markUserOffline(userId);
+      io.emit("collaborators-updated", { reason: "presence", userIds: [userId] });
     });
   });
 

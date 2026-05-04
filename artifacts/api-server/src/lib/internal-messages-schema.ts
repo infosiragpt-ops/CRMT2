@@ -27,6 +27,14 @@ export function ensureInternalMessagesSchema() {
       CREATE INDEX IF NOT EXISTS internal_messages_recipient_read_idx
         ON internal_messages (recipient_user_id, read_at)
     `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS internal_messages_recipient_sender_read_idx
+        ON internal_messages (recipient_user_id, sender_user_id, read_at)
+    `);
+    await db.execute(sql`
+      CREATE INDEX IF NOT EXISTS internal_messages_recipient_sender_created_idx
+        ON internal_messages (recipient_user_id, sender_user_id, created_at)
+    `);
   })();
   return schemaReady;
 }

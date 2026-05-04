@@ -4,6 +4,7 @@ import { count, eq, sql } from "drizzle-orm";
 import { db, internalMessagesTable, usersTable } from "@workspace/db";
 import { requireAdmin, requireAuth } from "../lib/auth";
 import { ensureChatAssignmentsSchema } from "../lib/chat-assignments-schema";
+import { emitCollaboratorsUpdated } from "../lib/internal-message-events";
 import { ensureInternalMessagesSchema } from "../lib/internal-messages-schema";
 import { normalizePermissions } from "../lib/permissions";
 import { isUserOnline } from "../lib/presence";
@@ -88,6 +89,7 @@ router.post("/collaborators", requireAdmin, async (req, res) => {
     })
     .returning();
 
+  emitCollaboratorsUpdated({ reason: "collaborator-change" });
   res.status(201).json(publicUser(user));
 });
 
@@ -107,6 +109,7 @@ router.patch("/collaborators/:id/permissions", requireAdmin, async (req, res) =>
     .where(eq(usersTable.id, id))
     .returning();
 
+  emitCollaboratorsUpdated({ reason: "collaborator-change" });
   res.json(publicUser(updated));
 });
 

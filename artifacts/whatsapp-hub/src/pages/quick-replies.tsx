@@ -4,7 +4,8 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
-import { ArrowLeft, Trash2, Paperclip, X, Play, FileText } from "lucide-react";
+import { ArrowLeft, Trash2, Paperclip, X, Play } from "lucide-react";
+import { OfficeFileIcon } from "@/components/office-file-icon";
 import { toast } from "sonner";
 
 type Attachment = {
@@ -221,9 +222,11 @@ export default function QuickRepliesPage() {
                           Audio
                         </div>
                       ) : (
-                        <div className="w-20 h-20 rounded-md border bg-[#f0f2f5] flex flex-col items-center justify-center gap-1 text-xs text-center p-1">
-                          <FileText className="w-5 h-5 text-[#667781]" />
-                          <span className="line-clamp-2 break-all">{a.fileName}</span>
+                        <div className="w-20 h-20 rounded-md border bg-[#f7f8f8] flex flex-col items-center justify-center gap-1 p-1">
+                          <OfficeFileIcon name={a.fileName} mimeType={a.mimeType} size="lg" />
+                          <span className="line-clamp-2 break-all text-[10px] leading-3 text-[#54656f]">
+                            {a.fileName}
+                          </span>
                         </div>
                       )}
                       <button

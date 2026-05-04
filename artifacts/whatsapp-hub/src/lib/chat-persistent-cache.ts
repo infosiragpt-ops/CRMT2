@@ -2,6 +2,7 @@ const DB_NAME = "crmt2-chat-cache";
 const STORE_NAME = "snapshots";
 const DB_VERSION = 1;
 const MAX_MESSAGES_PER_CHAT = 100;
+const MAX_TEAM_MESSAGES_PER_PEER = 50;
 
 type CacheEnvelope<T> = {
   key: string;
@@ -77,6 +78,14 @@ function messagesKey(sessionId: string, chatId: string) {
   return `messages:${sessionId}:${chatId}`;
 }
 
+function teamCollaboratorsKey() {
+  return "team:collaborators";
+}
+
+function teamMessagesKey(peerUserId: number) {
+  return `team:messages:${peerUserId}`;
+}
+
 export async function readCachedChats<T>(sessionId: string) {
   return readCache<T[]>(chatsKey(sessionId));
 }
@@ -99,4 +108,32 @@ export async function writeCachedMessages<T extends { timestamp?: number }>(
     .sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0))
     .slice(-MAX_MESSAGES_PER_CHAT);
   await writeCache(messagesKey(sessionId, chatId), compact);
+}
+
+export async function readCachedTeamCollaborators<T>() {
+  return readCache<T[]>(teamCollaboratorsKey());
+}
+
+export async function writeCachedTeamCollaborators<T>(collaborators: T[]) {
+  await writeCache(teamCollaboratorsKey(), collaborators);
+}
+
+export async function readCachedTeamMessages<T>(peerUserId: number) {
+  return readCache<T[]>(teamMessagesKey(peerUserId));
+}
+
+export async function writeCachedTeamMessages<T extends { createdAt?: string; id?: number }>(
+  peerUserId: number,
+  messages: T[],
+) {
+  const compact = messages
+    .slice()
+    .sort((a, b) => {
+      const left = a.createdAt ? Date.parse(a.createdAt) : 0;
+      const right = b.createdAt ? Date.parse(b.createdAt) : 0;
+      if (left !== right) return left - right;
+      return (a.id ?? 0) - (b.id ?? 0);
+    })
+    .slice(-MAX_TEAM_MESSAGES_PER_PEER);
+  await writeCache(teamMessagesKey(peerUserId), compact);
 }

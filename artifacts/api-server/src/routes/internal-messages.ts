@@ -1,10 +1,10 @@
 import { Router, type IRouter } from "express";
 import fs from "node:fs";
-import { and, asc, eq, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
 import { db, internalMessagesTable, usersTable } from "@workspace/db";
 import { requireAuth } from "../lib/auth";
 import { ensureInternalMessagesSchema } from "../lib/internal-messages-schema";
-import { emitInternalMessage } from "../lib/internal-message-events";
+import { emitCollaboratorsUpdated, emitInternalMessage, emitInternalRead } from "../lib/internal-message-events";
 import { publicUrlFor, uploadChatNoteFile } from "../lib/uploads";
 
 const router: IRouter = Router();
@@ -32,26 +32,50 @@ function serializeMessage(row: InternalMessageRow) {
   };
 }
 
+const messageFields = {
+  id: internalMessagesTable.id,
+  senderUserId: internalMessagesTable.senderUserId,
+  recipientUserId: internalMessagesTable.recipientUserId,
+  body: internalMessagesTable.body,
+  fileName: internalMessagesTable.fileName,
+  filePath: internalMessagesTable.filePath,
+  fileMimeType: internalMessagesTable.fileMimeType,
+  fileSizeBytes: internalMessagesTable.fileSizeBytes,
+  readAt: internalMessagesTable.readAt,
+  createdAt: internalMessagesTable.createdAt,
+  senderDisplayName: usersTable.displayName,
+  senderUsername: usersTable.username,
+};
+
 async function getMessage(id: number) {
   const [row] = await db
-    .select({
-      id: internalMessagesTable.id,
-      senderUserId: internalMessagesTable.senderUserId,
-      recipientUserId: internalMessagesTable.recipientUserId,
-      body: internalMessagesTable.body,
-      fileName: internalMessagesTable.fileName,
-      filePath: internalMessagesTable.filePath,
-      fileMimeType: internalMessagesTable.fileMimeType,
-      fileSizeBytes: internalMessagesTable.fileSizeBytes,
-      readAt: internalMessagesTable.readAt,
-      createdAt: internalMessagesTable.createdAt,
-      senderDisplayName: usersTable.displayName,
-      senderUsername: usersTable.username,
-    })
+    .select(messageFields)
     .from(internalMessagesTable)
     .innerJoin(usersTable, eq(internalMessagesTable.senderUserId, usersTable.id))
     .where(eq(internalMessagesTable.id, id));
   return row ? serializeMessage(row) : null;
+}
+
+async function ensurePeer(peerUserId: number) {
+  const [peer] = await db.select({ id: usersTable.id }).from(usersTable).where(eq(usersTable.id, peerUserId));
+  return peer ?? null;
+}
+
+async function listConversationMessages(currentUserId: number, peerUserId: number, limit: number) {
+  const rows = await db
+    .select(messageFields)
+    .from(internalMessagesTable)
+    .innerJoin(usersTable, eq(internalMessagesTable.senderUserId, usersTable.id))
+    .where(
+      or(
+        and(eq(internalMessagesTable.senderUserId, currentUserId), eq(internalMessagesTable.recipientUserId, peerUserId)),
+        and(eq(internalMessagesTable.senderUserId, peerUserId), eq(internalMessagesTable.recipientUserId, currentUserId)),
+      ),
+    )
+    .orderBy(desc(internalMessagesTable.createdAt))
+    .limit(limit);
+
+  return rows.reverse().map(serializeMessage);
 }
 
 router.get("/team/messages", async (req, res) => {
@@ -62,12 +86,29 @@ router.get("/team/messages", async (req, res) => {
     return void res.status(400).json({ error: "Colaborador inválido" });
   }
 
-  const [peer] = await db.select({ id: usersTable.id }).from(usersTable).where(eq(usersTable.id, peerUserId));
+  const peer = await ensurePeer(peerUserId);
   if (!peer) return void res.status(404).json({ error: "Colaborador no encontrado" });
 
+  const rawLimit = Number(req.query.limit);
+  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 200) : 200;
+  res.json(await listConversationMessages(currentUserId, peerUserId, limit));
+});
+
+router.post("/team/messages/read", async (req, res) => {
+  await ensureInternalMessagesSchema();
+  const currentUserId = req.session.userId!;
+  const peerUserId = Number(req.body?.peerUserId ?? req.body?.with);
+  if (!Number.isInteger(peerUserId) || peerUserId <= 0 || peerUserId === currentUserId) {
+    return void res.status(400).json({ error: "Colaborador inválido" });
+  }
+
+  const peer = await ensurePeer(peerUserId);
+  if (!peer) return void res.status(404).json({ error: "Colaborador no encontrado" });
+
+  const readAt = new Date();
   await db
     .update(internalMessagesTable)
-    .set({ readAt: new Date() })
+    .set({ readAt })
     .where(
       and(
         eq(internalMessagesTable.senderUserId, peerUserId),
@@ -76,33 +117,40 @@ router.get("/team/messages", async (req, res) => {
       ),
     );
 
-  const rows = await db
-    .select({
-      id: internalMessagesTable.id,
-      senderUserId: internalMessagesTable.senderUserId,
-      recipientUserId: internalMessagesTable.recipientUserId,
-      body: internalMessagesTable.body,
-      fileName: internalMessagesTable.fileName,
-      filePath: internalMessagesTable.filePath,
-      fileMimeType: internalMessagesTable.fileMimeType,
-      fileSizeBytes: internalMessagesTable.fileSizeBytes,
-      readAt: internalMessagesTable.readAt,
-      createdAt: internalMessagesTable.createdAt,
-      senderDisplayName: usersTable.displayName,
-      senderUsername: usersTable.username,
-    })
-    .from(internalMessagesTable)
-    .innerJoin(usersTable, eq(internalMessagesTable.senderUserId, usersTable.id))
-    .where(
-      or(
-        and(eq(internalMessagesTable.senderUserId, currentUserId), eq(internalMessagesTable.recipientUserId, peerUserId)),
-        and(eq(internalMessagesTable.senderUserId, peerUserId), eq(internalMessagesTable.recipientUserId, currentUserId)),
-      ),
-    )
-    .orderBy(asc(internalMessagesTable.createdAt))
-    .limit(200);
+  emitInternalRead({ readerUserId: currentUserId, peerUserId, readAt: readAt.toISOString() });
+  emitCollaboratorsUpdated({ reason: "internal-read", userIds: [currentUserId, peerUserId] });
+  res.json({ ok: true, readAt: readAt.toISOString() });
+});
 
-  res.json(rows.map(serializeMessage));
+router.post("/team/messages/snapshots", async (req, res) => {
+  await ensureInternalMessagesSchema();
+  const currentUserId = req.session.userId!;
+  const rawIds = Array.isArray(req.body?.peerUserIds) ? req.body.peerUserIds : [];
+  const peerUserIds: number[] = Array.from(
+    new Set<number>(
+      rawIds
+        .map((value: unknown) => Number(value))
+        .filter((value: number) => Number.isInteger(value) && value > 0 && value !== currentUserId),
+    ),
+  ).slice(0, 50);
+  const rawLimit = Number(req.body?.limit);
+  const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(Math.trunc(rawLimit), 1), 100) : 50;
+
+  if (peerUserIds.length === 0) return void res.json({});
+
+  const peers = await db
+    .select({ id: usersTable.id })
+    .from(usersTable)
+    .where(inArray(usersTable.id, peerUserIds));
+
+  const snapshots: Record<string, ReturnType<typeof serializeMessage>[]> = {};
+  await Promise.all(
+    peers.map(async (peer) => {
+      snapshots[String(peer.id)] = await listConversationMessages(currentUserId, peer.id, limit);
+    }),
+  );
+
+  res.json(snapshots);
 });
 
 router.post("/team/messages", uploadChatNoteFile.single("file"), async (req, res) => {
@@ -150,6 +198,7 @@ router.post("/team/messages", uploadChatNoteFile.single("file"), async (req, res
         recipientUserId,
         message,
       });
+      emitCollaboratorsUpdated({ reason: "internal-message", userIds: [currentUserId, recipientUserId] });
     }
     res.status(201).json(message);
   } catch (err) {

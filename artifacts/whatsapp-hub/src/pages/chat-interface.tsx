@@ -4,11 +4,16 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { format, isToday, isYesterday } from "date-fns";
 import { useSocket } from "@/lib/socket-context";
 import { useAuth } from "@/lib/auth-context";
+import { OfficeFileIcon } from "@/components/office-file-icon";
 import {
   readCachedChats,
   readCachedMessages,
+  readCachedTeamCollaborators,
+  readCachedTeamMessages,
   writeCachedChats,
   writeCachedMessages,
+  writeCachedTeamCollaborators,
+  writeCachedTeamMessages,
 } from "@/lib/chat-persistent-cache";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -977,20 +982,13 @@ function DocumentPreview({
   href?: string | null;
   compact?: boolean;
 }) {
-  const badge = fileBadge(name, mimeType);
   const content = (
     <div
       className={`flex items-center gap-3 rounded-lg bg-black/[0.04] ${
         compact ? "min-w-[220px] p-2" : "min-w-[280px] max-w-[400px] p-3"
       }`}
     >
-      <div
-        className={`grid shrink-0 place-items-center rounded-md text-[12px] font-bold text-white ${badge.color} ${
-          compact ? "h-9 w-8" : "h-11 w-9"
-        }`}
-      >
-        {badge.label}
-      </div>
+      <OfficeFileIcon name={name} mimeType={mimeType} size={compact ? "md" : "lg"} />
       <div className="min-w-0 flex-1">
         <div className={`${compact ? "text-[14px]" : "text-[16px]"} truncate font-semibold text-[#111b21]`}>
           {name}
@@ -1154,7 +1152,6 @@ function replaceMessageById(old: Message[] = [], replaceId: string, message: Mes
 
 function PendingFileTile({ file, onRemove }: { file: File; onRemove: () => void }) {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const badge = fileBadge(file.name, file.type);
   const previewKind = isImageFile(file) ? "image" : isVideoFile(file) ? "video" : null;
 
   useEffect(() => {
@@ -1194,9 +1191,7 @@ function PendingFileTile({ file, onRemove }: { file: File; onRemove: () => void 
 
   return (
     <div className="group relative flex h-16 min-w-[220px] max-w-[300px] items-center gap-3 rounded-xl border border-[#e4e7e8] bg-white px-3">
-      <div className={`grid h-11 w-9 shrink-0 place-items-center rounded-md text-[11px] font-bold text-white ${badge.color}`}>
-        {badge.label}
-      </div>
+      <OfficeFileIcon name={file.name} mimeType={file.type} size="lg" />
       <div className="min-w-0 flex-1">
         <div className="truncate text-[14px] font-semibold text-[#111b21]">{file.name}</div>
         <div className="text-[12px] text-[#667781]">{fileExtension(file.name)}</div>
@@ -1503,6 +1498,7 @@ export default function ChatInterface() {
     [isAdmin, user?.permissions],
   );
   const queryClient = useQueryClient();
+  const [cachedTeamCollaborators, setCachedTeamCollaborators] = useState<Collaborator[] | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 	  const messageTextareaRef = useRef<HTMLTextAreaElement>(null);
 	  const chatSearchInputRef = useRef<HTMLInputElement>(null);
@@ -1528,6 +1524,7 @@ export default function ChatInterface() {
   );
   const chatListPerfLoggedRef = useRef(false);
   const activeMessagesPerfLoggedRef = useRef<Record<string, boolean>>({});
+  const teamSnapshotsPrefetchKeyRef = useRef("");
 
 	  useEffect(() => {
 	    const textarea = messageTextareaRef.current;
@@ -1629,17 +1626,54 @@ export default function ChatInterface() {
 	    });
 	  }, [quickReplies, quickReplyCommandActive, quickReplyCommandQuery]);
 
-	  const { data: collaborators } = useQuery<Collaborator[]>({
+	  useEffect(() => {
+	    let cancelled = false;
+	    void readCachedTeamCollaborators<Collaborator>().then((cached) => {
+	      if (cancelled || !cached || !Array.isArray(cached.value)) return;
+	      setCachedTeamCollaborators(cached.value);
+	      queryClient.setQueryData<Collaborator[]>(["collaborators"], (old) =>
+	        old?.length ? old : cached.value,
+	      );
+	    });
+	    return () => {
+	      cancelled = true;
+	    };
+	  }, [queryClient]);
+
+	  const { data: collaboratorsData } = useQuery<Collaborator[]>({
 	    queryKey: ["collaborators"],
 	    queryFn: () => api<Collaborator[]>("/api/collaborators"),
-	    refetchInterval: 5_000,
+	    refetchInterval: socketConnected ? false : 5_000,
+	    staleTime: socketConnected ? 20_000 : 2_000,
 	  });
 
-	  const activeTeamUser = collaborators?.find((collaborator) => collaborator.id === activeTeamUserId) ?? null;
+	  const collaborators = collaboratorsData ?? cachedTeamCollaborators ?? [];
+
+	  useEffect(() => {
+	    if (!collaboratorsData?.length) return;
+	    setCachedTeamCollaborators(collaboratorsData);
+	    void writeCachedTeamCollaborators(collaboratorsData);
+	  }, [collaboratorsData]);
+
+	  useEffect(() => {
+	    if (!activeTeamUserId) return;
+	    let cancelled = false;
+	    void readCachedTeamMessages<InternalTeamMessage>(activeTeamUserId).then((cached) => {
+	      if (cancelled || !cached || !Array.isArray(cached.value)) return;
+	      queryClient.setQueryData<InternalTeamMessage[]>(["team-messages", activeTeamUserId], (old) =>
+	        old?.length ? old : cached.value,
+	      );
+	    });
+	    return () => {
+	      cancelled = true;
+	    };
+	  }, [activeTeamUserId, queryClient]);
+
+	  const activeTeamUser = collaborators.find((collaborator) => collaborator.id === activeTeamUserId) ?? null;
 
 	  const { data: teamMessages, isLoading: isTeamMessagesLoading } = useQuery<InternalTeamMessage[]>({
 	    queryKey: ["team-messages", activeTeamUserId],
-	    queryFn: () => api<InternalTeamMessage[]>(`/api/team/messages?with=${activeTeamUserId}`),
+	    queryFn: () => api<InternalTeamMessage[]>(`/api/team/messages?with=${activeTeamUserId}&limit=50`),
 	    enabled: !!activeTeamUserId,
 	    refetchInterval: socketConnected ? false : activeTeamUserId ? 4_000 : false,
 	    staleTime: MESSAGE_CACHE_STALE_MS,
@@ -1652,7 +1686,65 @@ export default function ChatInterface() {
     ? queryClient.getQueryData<InternalTeamMessage[]>(["team-messages", activeTeamUserId])
     : undefined;
   const displayedTeamMessages = teamMessages ?? cachedTeamMessages ?? [];
-  const showTeamMessagesLoading = isTeamMessagesLoading && !displayedTeamMessages.length && !cachedTeamMessages;
+  const showTeamMessagesSyncing = isTeamMessagesLoading && !displayedTeamMessages.length && !cachedTeamMessages;
+
+	  useEffect(() => {
+	    if (!activeTeamUserId || !teamMessages) return;
+	    void writeCachedTeamMessages(activeTeamUserId, teamMessages);
+	  }, [activeTeamUserId, teamMessages]);
+
+	  useEffect(() => {
+	    if (leftPanel !== "team" || collaborators.length === 0) return;
+	    const peerUserIds = collaborators
+	      .filter((collaborator) => collaborator.id !== user?.id)
+	      .sort((a, b) => {
+	        const unreadDelta = Math.max(b.unreadInternalCount ?? 0, 0) - Math.max(a.unreadInternalCount ?? 0, 0);
+	        if (unreadDelta !== 0) return unreadDelta;
+	        return a.displayName.localeCompare(b.displayName);
+	      })
+	      .slice(0, 25)
+	      .map((collaborator) => collaborator.id);
+	    if (peerUserIds.length === 0) return;
+	    const prefetchKey = peerUserIds.join(",");
+	    if (teamSnapshotsPrefetchKeyRef.current === prefetchKey) return;
+	    teamSnapshotsPrefetchKeyRef.current = prefetchKey;
+	    void api<Record<string, InternalTeamMessage[]>>("/api/team/messages/snapshots", {
+	      method: "POST",
+	      body: JSON.stringify({ peerUserIds, limit: 50 }),
+	    })
+	      .then((snapshots) => {
+	        for (const [peerUserIdText, messages] of Object.entries(snapshots)) {
+	          const peerUserId = Number(peerUserIdText);
+	          if (!Number.isInteger(peerUserId)) continue;
+	          queryClient.setQueryData<InternalTeamMessage[]>(["team-messages", peerUserId], (old = []) =>
+	            old.length ? appendUniqueTeamMessages(old, messages) : messages,
+	          );
+	          void writeCachedTeamMessages(peerUserId, messages);
+	        }
+	      })
+	      .catch(() => {
+	        teamSnapshotsPrefetchKeyRef.current = "";
+	      });
+	  }, [collaborators, leftPanel, queryClient, user?.id]);
+
+	  useEffect(() => {
+	    if (!activeTeamUserId) return;
+	    queryClient.setQueryData<Collaborator[]>(["collaborators"], (old) => {
+	      if (!old) return old;
+	      const next = old.map((collaborator) =>
+	        collaborator.id === activeTeamUserId ? { ...collaborator, unreadInternalCount: 0 } : collaborator,
+	      );
+	      setCachedTeamCollaborators(next);
+	      void writeCachedTeamCollaborators(next);
+	      return next;
+	    });
+	    void api("/api/team/messages/read", {
+	      method: "POST",
+	      body: JSON.stringify({ peerUserId: activeTeamUserId }),
+	    }).catch(() => {
+	      void queryClient.invalidateQueries({ queryKey: ["collaborators"] });
+	    });
+	  }, [activeTeamUserId, queryClient]);
 
   const { data: agentSettings } = useQuery<AgentSettingsResponse>({
     queryKey: ["agent-settings"],
@@ -2518,9 +2610,14 @@ export default function ChatInterface() {
 	              },
 	            ];
 
-	      queryClient.setQueryData<InternalTeamMessage[]>(["team-messages", recipientUser.id], (old = []) =>
-	        appendUniqueTeamMessages(old, optimisticMessages),
-	      );
+	      let nextMessages: InternalTeamMessage[] | undefined;
+	      queryClient.setQueryData<InternalTeamMessage[]>(["team-messages", recipientUser.id], (old = []) => {
+	        nextMessages = appendUniqueTeamMessages(old, optimisticMessages);
+	        return nextMessages;
+	      });
+	      if (files.length === 0 && nextMessages) {
+	        void writeCachedTeamMessages(recipientUser.id, nextMessages);
+	      }
 	      setTeamMessageInput("");
 	      setTeamMessageFiles([]);
 	      setIsDraggingTeamFiles(false);
@@ -2538,12 +2635,15 @@ export default function ChatInterface() {
 	    onSuccess: (created, _variables, context) => {
 	      const peerUserId = context?.peerUserId ?? activeTeamUserId;
 	      if (peerUserId) {
-	        queryClient.setQueryData<InternalTeamMessage[]>(["team-messages", peerUserId], (old = []) =>
-	          appendUniqueTeamMessages(
+	        let nextMessages: InternalTeamMessage[] | undefined;
+	        queryClient.setQueryData<InternalTeamMessage[]>(["team-messages", peerUserId], (old = []) => {
+	          nextMessages = appendUniqueTeamMessages(
 	            old.filter((item) => !context?.optimisticIds.includes(item.id)),
 	            created,
-	          ),
-	        );
+	          );
+	          return nextMessages;
+	        });
+	        if (nextMessages) void writeCachedTeamMessages(peerUserId, nextMessages);
 	      }
 	      context?.objectUrls.forEach((url) => URL.revokeObjectURL(url));
 	      void queryClient.invalidateQueries({ queryKey: ["collaborators"] });
@@ -2552,6 +2652,7 @@ export default function ChatInterface() {
 	    onError: (err, _variables, context) => {
 	      if (context) {
 	        queryClient.setQueryData<InternalTeamMessage[]>(["team-messages", context.peerUserId], context.previousMessages);
+	        if (context.previousMessages) void writeCachedTeamMessages(context.peerUserId, context.previousMessages);
 	        context.objectUrls.forEach((url) => URL.revokeObjectURL(url));
 	        setTeamMessageInput(context.previousInput);
 	        setTeamMessageFiles(context.previousFiles);
@@ -2884,13 +2985,16 @@ export default function ChatInterface() {
       const peerUserId =
         message.senderUserId === user.id ? message.recipientUserId : message.senderUserId;
 
-      queryClient.setQueryData<InternalTeamMessage[]>(["team-messages", peerUserId], (old = []) =>
-        appendUniqueTeamMessages(old, message),
-      );
+      queryClient.setQueryData<InternalTeamMessage[]>(["team-messages", peerUserId], (old = []) => {
+        const next = appendUniqueTeamMessages(old, message);
+        void writeCachedTeamMessages(peerUserId, next);
+        return next;
+      });
 
       if (message.senderUserId !== user.id) {
-        queryClient.setQueryData<Collaborator[]>(["collaborators"], (old) =>
-          old?.map((collaborator) =>
+        queryClient.setQueryData<Collaborator[]>(["collaborators"], (old) => {
+          if (!old) return old;
+          const next = old.map((collaborator) =>
             collaborator.id === peerUserId
               ? {
                   ...collaborator,
@@ -2900,8 +3004,17 @@ export default function ChatInterface() {
                       : (collaborator.unreadInternalCount || 0) + 1,
                 }
               : collaborator,
-          ),
-        );
+          );
+          setCachedTeamCollaborators(next);
+          void writeCachedTeamCollaborators(next);
+          return next;
+        });
+        if (activeTeamUserId === peerUserId) {
+          void api("/api/team/messages/read", {
+            method: "POST",
+            body: JSON.stringify({ peerUserId }),
+          });
+        }
         if (activeTeamUserId !== peerUserId) {
           toast.message(message.senderDisplayName || "Mensaje interno", {
             description: message.body || message.fileName || "Archivo interno",
@@ -2912,9 +3025,29 @@ export default function ChatInterface() {
         }
       }
     };
+    const handleInternalRead = (payload: { readerUserId?: number; peerUserId?: number; readAt?: string }) => {
+      if (!payload.readerUserId || !payload.peerUserId) return;
+      if (payload.readerUserId !== user.id) return;
+      queryClient.setQueryData<Collaborator[]>(["collaborators"], (old) => {
+        if (!old) return old;
+        const next = old.map((collaborator) =>
+          collaborator.id === payload.peerUserId ? { ...collaborator, unreadInternalCount: 0 } : collaborator,
+        );
+        setCachedTeamCollaborators(next);
+        void writeCachedTeamCollaborators(next);
+        return next;
+      });
+    };
+    const handleCollaboratorsUpdated = () => {
+      void queryClient.invalidateQueries({ queryKey: ["collaborators"] });
+    };
     socket.on("internal-message", handleInternalMessage);
+    socket.on("internal-read", handleInternalRead);
+    socket.on("collaborators-updated", handleCollaboratorsUpdated);
     return () => {
       socket.off("internal-message", handleInternalMessage);
+      socket.off("internal-read", handleInternalRead);
+      socket.off("collaborators-updated", handleCollaboratorsUpdated);
     };
   }, [activeTeamUserId, queryClient, socket, user?.id]);
 
@@ -4351,9 +4484,9 @@ export default function ChatInterface() {
 	              >
 	                <ScrollArea className="min-h-0 flex-1">
 	                  <div className="space-y-2 px-4 pb-4 pt-2">
-	                    {showTeamMessagesLoading ? (
+	                    {showTeamMessagesSyncing ? (
 	                      <div className="rounded-lg bg-white px-3 py-2 text-center text-[13px] text-[#667781]">
-	                        Cargando mensajes internos...
+	                        Sin mensajes guardados, sincronizando...
 	                      </div>
 	                    ) : displayedTeamMessages.length === 0 ? (
 	                      <div className="rounded-lg border border-dashed border-[#d1d7db] px-4 py-8 text-center text-[13px] text-[#667781]">
@@ -6855,9 +6988,12 @@ export default function ChatInterface() {
                 />
               ) : (
                 <div className="flex max-w-[360px] flex-col items-center rounded-xl border border-[#e4e7e8] bg-white px-6 py-8 text-center">
-                  <span className={`mb-3 grid h-12 min-w-12 place-items-center rounded-lg px-2 text-[12px] font-bold text-white ${fileBadge(notePreview.fileName || "Archivo", notePreview.fileMimeType).color}`}>
-                    {fileBadge(notePreview.fileName || "Archivo", notePreview.fileMimeType).label}
-                  </span>
+                  <OfficeFileIcon
+                    name={notePreview.fileName || "Archivo"}
+                    mimeType={notePreview.fileMimeType}
+                    size="xl"
+                    className="mb-3"
+                  />
                   <div className="max-w-full truncate text-[14px] font-semibold text-[#111b21]">
                     {notePreview.fileName || "Archivo"}
                   </div>
@@ -7057,7 +7193,6 @@ export default function ChatInterface() {
                     {mediaItems.length === 0
                       ? documentItems.slice(0, 4).map((msg) => {
                           const name = fileNameFromMessage(msg);
-                          const badge = fileBadge(name, msg.mediaMimeType);
                           return (
                             <button
                               key={msg.id}
@@ -7068,9 +7203,7 @@ export default function ChatInterface() {
                               }}
                               className="grid aspect-square place-items-center rounded-md bg-[#f0f2f5]"
                             >
-                              <span className={`grid h-10 w-9 place-items-center rounded-md text-[11px] font-bold text-white ${badge.color}`}>
-                                {badge.label}
-                              </span>
+                              <OfficeFileIcon name={name} mimeType={msg.mediaMimeType} size="md" />
                             </button>
                           );
                         })
@@ -7145,8 +7278,6 @@ export default function ChatInterface() {
                   {activeNotes.length > 0 ? (
                     <div className="space-y-1.5">
                       {activeNotes.map((note) => {
-                        const fileLabel = note.fileName || "Archivo";
-                        const badge = fileBadge(fileLabel, note.fileMimeType);
                         return (
                           <div key={note.id} className="rounded-md bg-[#f7f8f8] px-2.5 py-2 text-[10px] leading-4 text-[#54656f]">
                             <div className="flex items-center gap-1.5 text-[#111b21]">
@@ -7167,9 +7298,12 @@ export default function ChatInterface() {
                                 onClick={() => setNotePreview(note)}
                                 className="mt-1 flex w-full items-center gap-1.5 rounded-[6px] text-left text-[#111b21] hover:bg-white disabled:cursor-default"
                               >
-                                <span className={`grid h-4 min-w-5 place-items-center rounded-[3px] px-1 text-[8px] font-bold text-white ${badge.color}`}>
-                                  {badge.label}
-                                </span>
+                                <OfficeFileIcon
+                                  name={note.fileName}
+                                  mimeType={note.fileMimeType}
+                                  size="xs"
+                                  className="min-w-5"
+                                />
                                 <span className="min-w-0 flex-1 truncate">{note.fileName}</span>
                                 {note.fileSizeBytes ? (
                                   <span className="shrink-0 text-[#8696a0]">{formatFileSize(note.fileSizeBytes)}</span>
@@ -7210,12 +7344,9 @@ export default function ChatInterface() {
                     {noteFiles.length > 0 ? (
                       <div className="space-y-1.5 rounded-2xl border border-[#e4e7e8] bg-white px-2 py-2">
                         {noteFiles.map((file) => {
-                          const badge = fileBadge(file.name, file.type);
                           return (
                             <div key={`${file.name}:${file.size}:${file.lastModified}`} className="flex items-center gap-2 rounded-lg bg-white px-2 py-1.5 text-[10px] text-[#54656f]">
-                              <span className={`grid h-5 min-w-6 place-items-center rounded-[4px] px-1 text-[8px] font-bold text-white ${badge.color}`}>
-                                {badge.label}
-                              </span>
+                              <OfficeFileIcon name={file.name} mimeType={file.type} size="xs" className="min-w-6" />
                               <span className="min-w-0 flex-1 truncate">{file.name}</span>
                               <span className="shrink-0">{formatFileSize(file.size)}</span>
                               <button
