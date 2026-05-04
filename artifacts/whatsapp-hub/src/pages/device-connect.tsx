@@ -28,31 +28,74 @@ export default function DeviceConnect() {
   useEffect(() => {
     if (!socket || !sessionId) return;
 
-    socket.emit("subscribe-device", sessionId);
+    let cancelled = false;
 
-    socket.on("qr", (data: { sessionId: string; qr: string }) => {
+    const applyStatus = (data: { sessionId?: string; status: string; error?: string | null; qr?: string | null }) => {
+      if (data.sessionId && data.sessionId !== sessionId) return;
+      if (cancelled) return;
+      setStatus(data.status);
+      if (data.qr) setQrCode(data.qr);
+      if (data.error) setError(data.error);
+
+      if (data.status === "authenticated" || data.status === "ready") {
+        setTimeout(() => {
+          if (!cancelled) setLocation(`/devices/${sessionId}`);
+        }, data.status === "ready" ? 500 : 700);
+      }
+    };
+
+    const pollConnectionState = async () => {
+      const res = await fetch(`/api/devices/${sessionId}/connection-state`, { credentials: "include" });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      applyStatus(data);
+    };
+
+    const handleQr = (data: { sessionId: string; qr: string }) => {
       if (data.sessionId === sessionId) {
         setQrCode(data.qr);
         setStatus("qr");
       }
-    });
+    };
 
-    socket.on("status", (data: { sessionId: string; status: string; error?: string }) => {
-      if (data.sessionId === sessionId) {
-        setStatus(data.status);
-        if (data.error) setError(data.error);
-        
-        if (data.status === "ready") {
-          setTimeout(() => {
-            setLocation(`/devices/${sessionId}`);
-          }, 1000);
+    const handleStatus = (data: { sessionId: string; status: string; error?: string }) => {
+      applyStatus(data);
+    };
+
+    socket.on("qr", handleQr);
+    socket.on("status", handleStatus);
+    socket.emit("subscribe-device", sessionId);
+
+    const startConnection = async () => {
+      try {
+        setError(null);
+        setStatus("starting");
+        const res = await fetch(`/api/devices/${sessionId}/start`, {
+          method: "POST",
+          credentials: "include",
+        });
+        if (!res.ok) throw new Error(await res.text());
+        await pollConnectionState();
+      } catch (err) {
+        if (!cancelled) {
+          setStatus("auth_failure");
+          setError(err instanceof Error ? err.message : String(err));
         }
       }
-    });
+    };
+
+    void startConnection();
+    const pollId = window.setInterval(() => {
+      if (cancelled) return;
+      void pollConnectionState().catch(() => undefined);
+    }, 2500);
 
     return () => {
-      socket.off("qr");
-      socket.off("status");
+      cancelled = true;
+      window.clearInterval(pollId);
+      socket.emit("unsubscribe-device", sessionId);
+      socket.off("qr", handleQr);
+      socket.off("status", handleStatus);
     };
   }, [socket, sessionId, setLocation]);
 
@@ -90,15 +133,19 @@ export default function DeviceConnect() {
           </div>
           
           <div className="bg-[#f8f9fa] flex flex-col items-center justify-center p-10 min-h-[400px]">
-            {status === "ready" ? (
+            {status === "ready" || status === "authenticated" ? (
               <div className="text-center animate-in fade-in zoom-in duration-500">
                 <div className="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-4">
                   <div className="w-10 h-10 bg-green-500 rounded-full flex items-center justify-center text-white">
                     ✓
                   </div>
                 </div>
-                <h3 className="text-xl font-medium text-green-800">Ready!</h3>
-                <p className="text-green-600/80 mt-2">Redirecting to chats...</p>
+                <h3 className="text-xl font-medium text-green-800">
+                  {status === "ready" ? "WhatsApp listo" : "Conectado"}
+                </h3>
+                <p className="text-green-600/80 mt-2">
+                  {status === "ready" ? "Abriendo chats..." : "Sincronizando chats en segundo plano..."}
+                </p>
               </div>
             ) : status === "auth_failure" ? (
               <div className="text-center">

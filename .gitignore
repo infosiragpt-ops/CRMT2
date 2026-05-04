@@ -2,6 +2,7 @@
 
 # compiled output
 dist
+build
 tmp
 out-tsc
 *.tsbuildinfo
@@ -47,3 +48,17 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+.playwright-cli/
+output/
+
+# WhatsApp session data (Chromium user profiles with auth cookies — never commit)
+.wa-sessions/
+artifacts/api-server/.wwebjs_cache/
+artifacts/api-server/uploads/
+uploads/
+waticketsaast20/
+
+# Local env
+.env
+.env.*
+!.env.example

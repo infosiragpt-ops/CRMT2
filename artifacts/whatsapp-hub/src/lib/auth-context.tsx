@@ -5,6 +5,17 @@ type User = {
   id: number;
   username: string;
   displayName: string;
+  role: "admin" | "user";
+  permissions?: CollaboratorPermissions;
+};
+
+type CollaboratorPermissions = {
+  canReply: boolean;
+  canSendMedia: boolean;
+  canUseQuickReplies: boolean;
+  canManageQuickReplies: boolean;
+  canManageLabels: boolean;
+  canManageChats: boolean;
 };
 
 type AuthContextType = {

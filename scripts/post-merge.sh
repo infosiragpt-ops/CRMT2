@@ -1,4 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
+
 pnpm install --frozen-lockfile
-pnpm --filter db push
+pnpm --filter @workspace/db push

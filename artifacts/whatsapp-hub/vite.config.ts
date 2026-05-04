@@ -5,16 +5,9 @@ import path from "path";
 import runtimeErrorOverlay from "@replit/vite-plugin-runtime-error-modal";
 
 const rawPort = process.env.PORT;
+const port = rawPort ? Number(rawPort) : 4173;
 
-if (!rawPort) {
-  throw new Error(
-    "PORT environment variable is required but was not provided.",
-  );
-}
-
-const port = Number(rawPort);
-
-if (Number.isNaN(port) || port <= 0) {
+if (rawPort && (Number.isNaN(port) || port <= 0)) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
 }
 
@@ -66,6 +59,26 @@ export default defineConfig({
       strict: true,
       deny: ["**/.*"],
     },
+    proxy: process.env.API_PROXY_TARGET
+      ? {
+          "/api": {
+            target: process.env.API_PROXY_TARGET,
+            changeOrigin: true,
+            secure: false,
+          },
+          "/socket.io": {
+            target: process.env.API_PROXY_TARGET,
+            changeOrigin: true,
+            secure: false,
+            ws: true,
+          },
+          "/uploads": {
+            target: process.env.API_PROXY_TARGET,
+            changeOrigin: true,
+            secure: false,
+          },
+        }
+      : undefined,
   },
   preview: {
     port,

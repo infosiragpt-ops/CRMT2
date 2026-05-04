@@ -30,19 +30,19 @@ export default function Register() {
 
       if (res.ok) {
         await refresh();
-        setLocation("/devices");
+        setLocation("/");
       } else {
         const error = await res.text();
         toast({
-          title: "Registration failed",
+          title: "No se pudo completar el registro",
           description: error,
           variant: "destructive",
         });
       }
     } catch (error) {
       toast({
-        title: "Network error",
-        description: "Could not connect to server.",
+        title: "Error de red",
+        description: "No se pudo conectar con el servidor.",
         variant: "destructive",
       });
     } finally {
@@ -54,24 +54,24 @@ export default function Register() {
     <div className="flex min-h-[100dvh] items-center justify-center bg-muted/40 p-4">
       <Card className="w-full max-w-sm shadow-xl border-border/50">
         <CardHeader className="space-y-2 text-center">
-          <CardTitle className="text-2xl font-bold tracking-tight">Create an account</CardTitle>
-          <CardDescription>Get started with WhatsApp Hub</CardDescription>
+          <CardTitle className="text-2xl font-bold tracking-tight">Crear una cuenta</CardTitle>
+          <CardDescription>Empieza con WhatsApp Hub</CardDescription>
         </CardHeader>
         <form onSubmit={handleSubmit}>
           <CardContent className="space-y-4">
             <div className="space-y-2">
-              <Label htmlFor="displayName">Display Name</Label>
+              <Label htmlFor="displayName">Nombre visible</Label>
               <Input
                 id="displayName"
                 value={displayName}
                 onChange={(e) => setDisplayName(e.target.value)}
                 required
                 className="bg-background"
-                placeholder="E.g. John Doe"
+                placeholder="Ej. Juan Pérez"
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="username">Username</Label>
+              <Label htmlFor="username">Usuario</Label>
               <Input
                 id="username"
                 autoComplete="username"
@@ -82,7 +82,7 @@ export default function Register() {
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="password">Password</Label>
+              <Label htmlFor="password">Contraseña</Label>
               <Input
                 id="password"
                 type="password"
@@ -96,12 +96,12 @@ export default function Register() {
           </CardContent>
           <CardFooter className="flex flex-col space-y-4">
             <Button type="submit" className="w-full font-medium" disabled={isSubmitting}>
-              {isSubmitting ? "Registering..." : "Register"}
+              {isSubmitting ? "Creando cuenta..." : "Registrarse"}
             </Button>
             <div className="text-sm text-center text-muted-foreground">
-              Already have an account?{" "}
+              ¿Ya tienes una cuenta?{" "}
               <Link href="/login" className="text-primary hover:underline font-medium">
-                Login
+                Iniciar sesión
               </Link>
             </div>
           </CardFooter>

@@ -4,6 +4,7 @@ import { useAuth } from "./auth-context";
 
 type SocketContextType = {
   socket: Socket | null;
+  connected: boolean;
 };
 
 const SocketContext = createContext<SocketContextType | undefined>(undefined);
@@ -11,28 +12,44 @@ const SocketContext = createContext<SocketContextType | undefined>(undefined);
 export function SocketProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth();
   const [socket, setSocket] = useState<Socket | null>(null);
+  const [connected, setConnected] = useState(false);
 
   useEffect(() => {
     if (!user) {
-      if (socket) {
-        socket.disconnect();
-        setSocket(null);
-      }
-      return;
+      setSocket((current) => {
+        current?.disconnect();
+        return null;
+      });
+      setConnected(false);
+      return undefined;
     }
 
-    if (!socket) {
-      const newSocket = io({ path: "/socket.io", withCredentials: true });
-      setSocket(newSocket);
+    const newSocket = io({
+      path: "/socket.io",
+      withCredentials: true,
+      transports: ["websocket", "polling"],
+      rememberUpgrade: true,
+      reconnectionDelay: 300,
+      reconnectionDelayMax: 2_500,
+      timeout: 5_000,
+    });
+    const handleConnect = () => setConnected(true);
+    const handleDisconnect = () => setConnected(false);
+    newSocket.on("connect", handleConnect);
+    newSocket.on("disconnect", handleDisconnect);
+    setSocket(newSocket);
 
-      return () => {
-        newSocket.disconnect();
-      };
-    }
+    return () => {
+      newSocket.off("connect", handleConnect);
+      newSocket.off("disconnect", handleDisconnect);
+      newSocket.disconnect();
+      setSocket(null);
+      setConnected(false);
+    };
   }, [user]);
 
   return (
-    <SocketContext.Provider value={{ socket }}>
+    <SocketContext.Provider value={{ socket, connected }}>
       {children}
     </SocketContext.Provider>
   );

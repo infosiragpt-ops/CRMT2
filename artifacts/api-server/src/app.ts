@@ -1,9 +1,11 @@
-import express, { type Express } from "express";
+import express, { type ErrorRequestHandler, type Express } from "express";
 import cors from "cors";
 import pinoHttp from "pino-http";
 import router from "./routes";
 import { logger } from "./lib/logger";
-import { sessionMiddleware } from "./lib/auth";
+import { requireAuth, sessionMiddleware } from "./lib/auth";
+import { setUploadStaticHeaders, UPLOADS_DIR } from "./lib/uploads";
+import { corsOptionsForRequest, requireTrustedOrigin } from "./lib/http-security";
 
 const app: Express = express();
 
@@ -22,28 +24,42 @@ app.use(
     },
   }),
 );
-const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.REPLIT_DEV_DOMAIN || "")
-  .split(",")
-  .map((o) => o.trim())
-  .filter(Boolean)
-  .map((o) => (o.startsWith("http") ? o : `https://${o}`));
-
-app.use(
-  cors({
-    origin(origin, cb) {
-      // Same-origin (no Origin header) or in allowlist
-      if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
-        return cb(null, true);
-      }
-      cb(new Error("Origin not allowed"));
-    },
-    credentials: true,
-  }),
-);
+app.use(cors(corsOptionsForRequest));
+app.use(requireTrustedOrigin);
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(sessionMiddleware);
 
+app.use(
+  "/uploads",
+  requireAuth,
+  express.static(UPLOADS_DIR, {
+    dotfiles: "deny",
+    fallthrough: true,
+    index: false,
+    maxAge: "7d",
+    setHeaders: setUploadStaticHeaders,
+  }),
+);
 app.use("/api", router);
+
+const errorHandler: ErrorRequestHandler = (err, req, res, next) => {
+  if (res.headersSent) return next(err);
+
+  const isMulterError = err?.name === "MulterError" || typeof err?.code === "string" && err.code.startsWith("LIMIT_");
+  const rawStatus = Number(err?.status ?? err?.statusCode ?? (isMulterError ? 400 : undefined));
+  const status = rawStatus >= 400 && rawStatus < 600 ? rawStatus : 500;
+  const message =
+    status >= 500
+      ? "Internal server error"
+      : typeof err?.message === "string" && err.message
+        ? err.message
+        : "Request failed";
+
+  logger.error({ err, method: req.method, path: req.path, status }, "request failed");
+  res.status(status).json({ error: message });
+};
+
+app.use(errorHandler);
 
 export default app;
